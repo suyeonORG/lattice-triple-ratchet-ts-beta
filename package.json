@@ -1,0 +1,35 @@
+{
+  "name": "lattice-triple-ratchet-ts-beta",
+  "version": "1.0.0",
+  "description": "Triple Ratchet using Lattice based X3DH",
+  "main": "index.js",
+  "scripts": {
+    "lint": "eslint 'src/**/*.ts'",
+    "format": "prettier --write 'src/**/*.ts'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suyeonORG/lattice-triple-ratchet-ts-beta.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/suyeonORG/lattice-triple-ratchet-ts-beta/issues"
+  },
+  "homepage": "https://github.com/suyeonORG/lattice-triple-ratchet-ts-beta#readme",
+  "devDependencies": {
+    "@tsconfig/recommended": "^1.0.8",
+    "@types/node": "^22.13.5",
+    "@typescript-eslint/eslint-plugin": "^8.24.1",
+    "@typescript-eslint/parser": "^8.24.1",
+    "eslint": "^9.21.0",
+    "eslint-config-prettier": "^10.0.1",
+    "eslint-plugin-prettier": "^5.2.3",
+    "prettier": "^3.5.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.6"
+  }
+}
