@@ -1,0 +1,1888 @@
+```constants.ts
+// === File: src/constants.ts ===
+
+import { p256 } from "@noble/curves/p256"; // Needed for P256_ORDER
+
+export const CURVE_NAME = "P-256"; // Still relevant for context, matches noble p256
+export const HASH_ALGORITHM_NAME = "SHA-256"; // For Web Crypto hashData
+export const HMAC_ALGORITHM = {
+  name: "HMAC",
+  hash: { name: "SHA-256" },
+} as const; // For Web Crypto HKDF/HMACKey import
+export const AES_ALGORITHM = { name: "AES-GCM", length: 256 } as const; // For Web Crypto AES
+export const INFO_RATCHET = new TextEncoder().encode("TripleRatchetInfo");
+export const MAX_SKIP = 100; // Maximum number of message keys to skip
+export const P256_ORDER = p256.CURVE.n; // Order of the P-256 curve for modular arithmetic
+
+```
+
+```crypto\crypto-utils.ts
+// === File: src/crypto/crypto-utils.ts ===
+
+import { p256 } from "@noble/curves/p256";
+import { sha256 } from "@noble/hashes/sha256";
+// import { hmac } from '@noble/hashes/hmac'; // Only needed for manual HKDF
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
+import { getCrypto } from "../utils/environment"; // Use relative path
+import { concatBuffers } from "../utils/buffer"; // Use relative path
+import {
+  AES_ALGORITHM,
+  HMAC_ALGORITHM,
+  HASH_ALGORITHM_NAME,
+  INFO_RATCHET, // Needed for HKDF
+} from "../constants"; // Use relative path
+import type {
+  // Use 'type' import for interfaces/types
+  ECKeyPair,
+  SigningKeyPair,
+  ECDHPublicKey,
+  ECDHPrivateKey,
+  ECDSAPublicKey,
+  ECDSAPrivateKey,
+  SerializedECPublicKey, // This type uses hex string now
+  HMACKey,
+  AESKey,
+} from "../types"; // Use relative path
+
+/**
+ * Generates a new ECDH key pair (P-256) using noble-curves.
+ * @returns An ECKeyPair with keys as Uint8Array.
+ */
+export function generateECDHKeyPair(): ECKeyPair {
+  const privateKey = p256.utils.randomPrivateKey();
+  const publicKey = p256.getPublicKey(privateKey, false); // false = uncompressed format
+  return {
+    privateKey: privateKey, // 32 bytes scalar
+    publicKey: publicKey, // 65 bytes (0x04 + x + y)
+  };
+}
+
+/**
+ * Generates a new ECDSA signing key pair (P-256) using noble-curves.
+ * @returns A SigningKeyPair with keys as Uint8Array.
+ */
+export function generateSigningKeyPair(): SigningKeyPair {
+  const privateKey = p256.utils.randomPrivateKey();
+  const publicKey = p256.getPublicKey(privateKey, false); // Use uncompressed for consistency
+  return {
+    privateKey: privateKey,
+    publicKey: publicKey,
+  };
+}
+
+/**
+ * Computes Diffie-Hellman shared secret using noble-curves (P-256).
+ * @param privateKey Our ECDH private key bytes.
+ * @param publicKey Their ECDH public key bytes (uncompressed or compressed).
+ * @returns The shared secret as a Uint8Array (32 bytes, x-coordinate).
+ */
+export function computeDH(
+  privateKey: ECDHPrivateKey,
+  publicKey: ECDHPublicKey
+): Uint8Array {
+  // noble automatically handles compressed/uncompressed public keys
+  const sharedPoint = p256.getSharedSecret(privateKey, publicKey);
+  // The shared secret is the x-coordinate of the shared point.
+  return sharedPoint.slice(0, 32);
+}
+
+/**
+ * Derives keys using HKDF (HMAC-SHA256) via Web Crypto.
+ * @param input The input key material (IKM) (ArrayBuffer or Uint8Array).
+ * @param salt Optional salt (recommended) (ArrayBuffer or Uint8Array). Defaults to zero bytes.
+ * @param info Optional context/application-specific info (ArrayBuffer or Uint8Array). Defaults to empty.
+ * @param keyCount The number of output keys to derive.
+ * @param keyLengthBytes The length of each derived key in bytes (default: 32).
+ * @returns A Promise resolving to an array of derived keys (ArrayBuffer).
+ */
+export async function hkdfDerive(
+  input: ArrayBuffer | Uint8Array,
+  salt: ArrayBuffer | Uint8Array | null,
+  info: ArrayBuffer | Uint8Array | null,
+  keyCount: number,
+  keyLengthBytes: number = 32
+): Promise<ArrayBuffer[]> {
+  const crypto = getCrypto();
+  const saltBytes = salt ? new Uint8Array(salt) : new Uint8Array(32); // Default salt: 32 zeros
+  const infoBytes = info ? new Uint8Array(info) : new Uint8Array(0); // Default info: empty
+  const inputBytes = new Uint8Array(input);
+
+  // 1. Import IKM as a temporary key for HKDF
+  const ikmKey = await crypto.subtle.importKey(
+    "raw",
+    inputBytes,
+    { name: "HKDF" },
+    false,
+    ["deriveKey"]
+  );
+
+  // 2. Derive the keys
+  const derivedKeyPromises = [];
+  for (let i = 0; i < keyCount; i++) {
+    const currentInfo = concatBuffers(infoBytes, new Uint8Array([i]));
+    derivedKeyPromises.push(
+      crypto.subtle
+        .deriveKey(
+          {
+            name: "HKDF",
+            salt: saltBytes,
+            info: currentInfo,
+            hash: HASH_ALGORITHM_NAME,
+          },
+          ikmKey,
+          {
+            name: "HMAC",
+            hash: HASH_ALGORITHM_NAME,
+            length: keyLengthBytes * 8,
+          },
+          true, // Allow export
+          ["sign", "verify"]
+        )
+        .then((key) => crypto.subtle.exportKey("raw", key))
+    );
+  }
+  return Promise.all(derivedKeyPromises);
+}
+
+/**
+ * Imports a raw key as an HMAC key (SHA-256) using Web Crypto.
+ * @param keyData The raw key material (ArrayBuffer or Uint8Array).
+ * @returns A Promise resolving to the HMACKey (CryptoKey).
+ */
+export async function importHmacKey(
+  keyData: ArrayBuffer | Uint8Array
+): Promise<HMACKey> {
+  const crypto = getCrypto();
+  return crypto.subtle.importKey("raw", keyData, HMAC_ALGORITHM, false, [
+    "sign",
+    "verify",
+  ]);
+}
+
+/**
+ * Imports a raw key as an AES-GCM key (256-bit) using Web Crypto.
+ * @param keyData The raw key material (ArrayBuffer or Uint8Array, must be 32 bytes).
+ * @returns A Promise resolving to the AESKey (CryptoKey).
+ */
+export async function importAesKey(
+  keyData: ArrayBuffer | Uint8Array
+): Promise<AESKey> {
+  const keyBytes = new Uint8Array(keyData);
+  if (keyBytes.length !== 32) {
+    throw new Error(
+      `AES key data must be 32 bytes, received ${keyBytes.length}`
+    );
+  }
+  const crypto = getCrypto();
+  return crypto.subtle.importKey("raw", keyBytes, AES_ALGORITHM, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+/**
+ * Signs data with an ECDSA private key (P-256 SHA-256) using noble-curves.
+ * @param privateKey The ECDSAPrivateKey bytes to sign with.
+ * @param data The Uint8Array data to sign.
+ * @returns A Promise resolving to the signature as a Uint8Array (compact R/S format).
+ */
+export async function signData(
+  privateKey: ECDSAPrivateKey,
+  data: Uint8Array // Data to be signed (will be hashed)
+): Promise<Uint8Array> {
+  const messageHash = sha256(data); // Hash the data first
+  const signature = await p256.ecdsaSign(messageHash, privateKey);
+  return signature.toCompactRawBytes(); // Return 64-byte compact signature
+}
+
+/**
+ * Verifies an ECDSA signature (P-256 SHA-256) using noble-curves.
+ * @param publicKey The ECDSAPublicKey bytes to verify with.
+ * @param signature The signature Uint8Array (compact R/S format expected).
+ * @param data The original data Uint8Array (will be hashed internally).
+ * @returns A Promise resolving to true if the signature is valid, false otherwise.
+ */
+export async function verifySignature(
+  publicKey: ECDSAPublicKey,
+  signature: Uint8Array, // Expecting compact R/S format
+  data: Uint8Array // The original data that was signed
+): Promise<boolean> {
+  const messageHash = sha256(data); // Hash the data first
+  try {
+    return p256.ecdsaVerify(signature, messageHash, publicKey);
+  } catch (error) {
+    console.error("Signature verification failed:", error);
+    return false;
+  }
+}
+
+/**
+ * Serializes an EC public key (Uint8Array) to a hex string.
+ * @param publicKey The public key bytes.
+ * @returns The hex string representation (SerializedECPublicKey).
+ */
+export function serializePublicKey(
+  publicKey: ECDHPublicKey | ECDSAPublicKey
+): SerializedECPublicKey {
+  return bytesToHex(publicKey);
+}
+
+/**
+ * Deserializes an EC public key from a hex string.
+ * @param serialized The hex string representation.
+ * @returns The public key as Uint8Array.
+ */
+export function deserializePublicKey(
+  serialized: SerializedECPublicKey
+): Uint8Array {
+  // Add validation if needed (e.g., check length, format)
+  return hexToBytes(serialized);
+}
+
+/**
+ * Computes a SHA-256 hash of the input data using Web Crypto.
+ * @param data The ArrayBuffer or Uint8Array data to hash.
+ * @returns A Promise resolving to the hash digest as an ArrayBuffer (32 bytes).
+ */
+export async function hashData(
+  data: ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer> {
+  const crypto = getCrypto();
+  return crypto.subtle.digest(HASH_ALGORITHM_NAME, data);
+}
+
+/**
+ * Encrypts data using AES-GCM (256-bit) via Web Crypto.
+ * @param key The AESKey (CryptoKey) to use for encryption.
+ * @param plaintext The ArrayBuffer or Uint8Array data to encrypt.
+ * @param iv The initialization vector (ArrayBuffer or Uint8Array, typically 12 bytes).
+ * @param additionalData Optional additional authenticated data (AAD) (ArrayBuffer or Uint8Array).
+ * @returns A Promise resolving to the ciphertext as an ArrayBuffer.
+ */
+export async function encryptAES(
+  key: AESKey,
+  plaintext: ArrayBuffer | Uint8Array,
+  iv: ArrayBuffer | Uint8Array,
+  additionalData?: ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer> {
+  const crypto = getCrypto();
+  const params: AesGcmParams = { name: AES_ALGORITHM.name, iv: iv };
+  if (additionalData) {
+    params.additionalData = additionalData;
+  }
+  return crypto.subtle.encrypt(params, key, plaintext);
+}
+
+/**
+ * Decrypts data using AES-GCM (256-bit) via Web Crypto.
+ * @param key The AESKey (CryptoKey) to use for decryption.
+ * @param ciphertext The ArrayBuffer or Uint8Array data to decrypt.
+ * @param iv The initialization vector (ArrayBuffer or Uint8Array) used during encryption.
+ * @param additionalData Optional additional authenticated data (AAD) used during encryption.
+ * @returns A Promise resolving to the original plaintext as an ArrayBuffer.
+ */
+export async function decryptAES(
+  key: AESKey,
+  ciphertext: ArrayBuffer | Uint8Array,
+  iv: ArrayBuffer | Uint8Array,
+  additionalData?: ArrayBuffer | Uint8Array
+): Promise<ArrayBuffer> {
+  const crypto = getCrypto();
+  const params: AesGcmParams = { name: AES_ALGORITHM.name, iv: iv };
+  if (additionalData) {
+    params.additionalData = additionalData;
+  }
+  try {
+    return await crypto.subtle.decrypt(params, key, ciphertext);
+  } catch (e) {
+    console.error("AES decryption failed:", e);
+    throw new Error(
+      `Decryption failed. Data may be corrupt or key/IV incorrect. ${e}`
+    );
+  }
+}
+
+/**
+ * Exports a Web Crypto CryptoKey to its raw representation (ArrayBuffer).
+ * @param key The CryptoKey to export (must be exportable and support 'raw' format).
+ * @returns A Promise resolving to the raw key material as an ArrayBuffer.
+ */
+export async function exportRawKey(key: CryptoKey): Promise<ArrayBuffer> {
+  const crypto = getCrypto();
+  try {
+    return await crypto.subtle.exportKey("raw", key);
+  } catch (e) {
+    console.error("Failed to export raw key:", e);
+    throw new Error(`Could not export key in raw format: ${e}`);
+  }
+}
+
+/**
+ * Compares two public keys (Uint8Array) for equality using constant time buffer comparison.
+ * @param keyA The first public key bytes.
+ * @param keyB The second public key bytes.
+ * @returns True if the keys are equal, false otherwise.
+ */
+export function equalPublicKeys(
+  keyA: ECDHPublicKey | ECDSAPublicKey,
+  keyB: ECDHPublicKey | ECDSAPublicKey
+): boolean {
+  // Assuming equalBuffers provides constant time comparison
+  return equalBuffers(keyA, keyB);
+}
+
+```
+
+```protocol\ratchet-logic.ts
+// === File: src/protocol/ratchet-logic.ts ===
+
+import { p256 } from "@noble/curves/p256"; // For P256_ORDER and utils
+import { sha256 } from "@noble/hashes/sha256"; // For hashing in enhancement
+import { bytesToHex } from "@noble/hashes/utils"; // For skipped key lookup
+
+import {
+  INFO_RATCHET,
+  MAX_SKIP,
+  P256_ORDER, // Import curve order
+  HMAC_ALGORITHM, // Added import
+} from "../constants";
+import {
+  generateECDHKeyPair, // Use the noble-based one
+  computeDH, // Use the noble-based one
+  hkdfDerive,
+  importHmacKey,
+  importAesKey,
+  encryptAES,
+  decryptAES,
+  exportRawKey,
+  equalPublicKeys, // Use the noble-based one
+  verifySignature, // Use the noble-based one
+  hashData, // Web Crypto hash for H(I_t) - could switch to noble sha256 if preferred
+  signData, // Added import for signing
+} from "../crypto/crypto-utils";
+import {
+  concatBuffers,
+  equalBuffers, // For general buffer comparison if needed
+  stringToBytes,
+  bytesToString,
+} from "../utils/buffer";
+import { getCrypto } from "../utils/environment"; // Added import
+
+import type {
+  // Use 'type' import
+  RatchetState,
+  RatchetChainState,
+  IdentityState,
+  MessageKeys,
+  HMACKey, // Web Crypto type
+  AESKey, // Web Crypto type
+  RatchetMessage,
+  MessageHeader,
+  PreKeyBundle,
+  ECKeyPair, // Uses Uint8Array keys now
+  ECDHPrivateKey, // Uint8Array
+  ECDHPublicKey, // Uint8Array
+  MessageType,
+} from "../types";
+
+// --- Symmetric Key Ratchet (Chain Key) Logic ---
+
+/**
+ * Derives message keys (AES encryption key, HMAC auth key, IV) from a chain key state.
+ * Uses Web Crypto keys. Does not advance the chain state itself.
+ * @param chainKey The current HMAC chain key (CryptoKey).
+ * @returns A Promise resolving to the MessageKeys.
+ */
+async function deriveMessageKeysFromChainKey(
+  chainKey: HMACKey
+): Promise<MessageKeys> {
+  const crypto = getCrypto(); // Assuming getCrypto is available via import
+  const messageKeyInput = stringToBytes("MessageKey");
+
+  const derivedCombinedKey = await crypto.subtle.sign(
+    HMAC_ALGORITHM.name,
+    chainKey,
+    messageKeyInput
+  );
+  const keys = await hkdfDerive(derivedCombinedKey, null, INFO_RATCHET, 3, 32);
+  const iv = keys[2].slice(0, 12); // Use 12 bytes for AES-GCM IV
+
+  return {
+    encKey: await importAesKey(keys[0]),
+    authKey: await importHmacKey(keys[1]),
+    iv: iv,
+  };
+}
+
+/**
+ * Advances a chain key state to the next key in the sequence.
+ * Uses Web Crypto keys.
+ * @param chainKey The current HMAC chain key (CryptoKey).
+ * @returns A Promise resolving to the next HMAC chain key (CryptoKey).
+ */
+async function advanceChainKey(chainKey: HMACKey): Promise<HMACKey> {
+  const crypto = getCrypto(); // Assuming getCrypto is available via import
+  const nextKeyInput = stringToBytes("NextChainKey");
+  const nextKeyMaterial = await crypto.subtle.sign(
+    HMAC_ALGORITHM.name,
+    chainKey,
+    nextKeyInput
+  );
+  return importHmacKey(nextKeyMaterial);
+}
+
+/**
+ * Gets a message key from a symmetric ratchet chain state for a specific counter.
+ * Advances the chain state past the requested counter and stores skipped keys.
+ * @param chainState The current state of the symmetric ratchet chain.
+ * @param counter The desired message counter index.
+ * @returns A Promise resolving to an object containing the MessageKeys and the updated RatchetChainState.
+ */
+export async function getSymRatchetMessageKey(
+  chainState: RatchetChainState,
+  counter: number
+): Promise<{ messageKeys: MessageKeys; nextChainState: RatchetChainState }> {
+  let currentChainKey = chainState.chainKey;
+  let currentIndex = chainState.chainIndex;
+  const newSkippedKeys = new Map(chainState.skippedMessageKeys);
+
+  if (newSkippedKeys.has(counter)) {
+    const messageKeys = newSkippedKeys.get(counter)!;
+    newSkippedKeys.delete(counter);
+    return {
+      messageKeys,
+      nextChainState: { ...chainState, skippedMessageKeys: newSkippedKeys },
+    };
+  }
+
+  if (counter < currentIndex) {
+    throw new Error(
+      `Message key for past counter ${counter} not found (current index: ${currentIndex})`
+    );
+  }
+  if (counter - currentIndex > MAX_SKIP) {
+    throw new Error(
+      `Skipping too many messages (${counter - currentIndex}, max: ${MAX_SKIP})`
+    );
+  }
+
+  while (currentIndex < counter) {
+    const messageKeys = await deriveMessageKeysFromChainKey(currentChainKey);
+    newSkippedKeys.set(currentIndex, messageKeys);
+    currentChainKey = await advanceChainKey(currentChainKey);
+    currentIndex++;
+
+    if (newSkippedKeys.size > MAX_SKIP * 2) {
+      const oldestKey = Math.min(...newSkippedKeys.keys());
+      if (currentIndex - oldestKey > MAX_SKIP * 2) {
+        newSkippedKeys.delete(oldestKey);
+      }
+    }
+  }
+
+  const requestedMessageKeys = await deriveMessageKeysFromChainKey(
+    currentChainKey
+  );
+  const nextChainKey = await advanceChainKey(currentChainKey);
+  const nextIndex = currentIndex + 1;
+
+  const nextState: RatchetChainState = {
+    chainKey: nextChainKey,
+    chainIndex: nextIndex,
+    skippedMessageKeys: newSkippedKeys,
+  };
+
+  return { messageKeys: requestedMessageKeys, nextChainState: nextState };
+}
+
+// --- Diffie-Hellman (DH) Ratchet Logic ---
+
+/**
+ * Performs the DH ratchet step calculation using Web Crypto HKDF.
+ * Derives a new root key and a new chain key from the DH result and the current root key.
+ * @param rootKey The current root key (HMACKey - CryptoKey).
+ * @param dhOutput The result of the ECDH computation (Uint8Array).
+ * @returns A Promise resolving to { newRootKey: HMACKey, newChainKey: HMACKey }.
+ */
+async function performDHRatchetStep(
+  rootKey: HMACKey,
+  dhOutput: Uint8Array
+): Promise<{ newRootKey: HMACKey; newChainKey: HMACKey }> {
+  const rootKeyRaw = await exportRawKey(rootKey);
+  const derivedKeys = await hkdfDerive(dhOutput, rootKeyRaw, INFO_RATCHET, 2);
+  const newRootKey = await importHmacKey(derivedKeys[0]);
+  const newChainKey = await importHmacKey(derivedKeys[1]);
+  return { newRootKey, newChainKey };
+}
+
+// --- Triple Ratchet Enhancement ---
+
+/**
+ * Converts a Uint8Array to a BigInt. Assumes big-endian format.
+ * @param bytes The input bytes.
+ * @returns The corresponding BigInt.
+ */
+function bytesToBigInt(bytes: Uint8Array): bigint {
+  let result = 0n;
+  for (let i = 0; i < bytes.length; i++) {
+    result = (result << 8n) + BigInt(bytes[i]);
+  }
+  return result;
+}
+
+/**
+ * Calculates the "enhanced" private key for the Triple Ratchet: x_t' = (x_t * H(I_t)) mod n
+ * Uses noble-curves for modular arithmetic.
+ * @param privateKeyBytes The original private key scalar bytes (x_t).
+ * @param sharedSecret The shared secret derived via DH (I_t) (Uint8Array).
+ * @returns The enhanced private key bytes (x_t'). Note: This is now synchronous.
+ */
+function calculateEnhancedPrivateKey(
+  privateKeyBytes: ECDHPrivateKey,
+  sharedSecret: Uint8Array // I_t
+): ECDHPrivateKey {
+  // 1. Hash the shared secret: H(I_t)
+  const hashedSecretBytes = sha256(sharedSecret); // Use noble sha256
+
+  // 2. Convert private key and hash to BigInt scalars
+  const privateScalar = bytesToBigInt(privateKeyBytes);
+  const hashScalar = bytesToBigInt(hashedSecretBytes);
+
+  // 3. Perform modular multiplication: (x_t * H(I_t)) mod n
+  const enhancedScalar = p256.utils.mod(privateScalar * hashScalar, P256_ORDER);
+
+  // 4. Convert the resulting BigInt scalar back to 32 bytes
+  const enhancedPrivateKeyBytes = p256.utils.scalarToBytes(enhancedScalar);
+
+  console.debug("Triple Ratchet: Enhanced private key calculated.");
+  return enhancedPrivateKeyBytes;
+}
+
+// --- Ratchet Initialization Logic ---
+
+/**
+ * Initializes the RatchetState for the initiator using the recipient's PreKeyBundle.
+ * Uses noble-curves for EC operations.
+ * @param ownIdentityState Our identity information.
+ * @param preKeyBundle The recipient's PreKeyBundle.
+ * @returns A Promise resolving to the initial RatchetState for the initiator.
+ */
+export async function initializeRatchetInitiator(
+  ownIdentityState: IdentityState,
+  preKeyBundle: PreKeyBundle
+): Promise<RatchetState> {
+  // 1. Verify the signed prekey signature
+  const isSignatureValid = await verifySignature(
+    preKeyBundle.signingKey,
+    preKeyBundle.signedPreKeySignature,
+    preKeyBundle.signedPreKey // Sign the public key bytes directly
+  );
+  if (!isSignatureValid) {
+    throw new Error("Invalid signature on signed prekey in PreKeyBundle.");
+  }
+
+  // 2. Generate our ephemeral key pair
+  const ephemeralKeyPair = generateECDHKeyPair();
+
+  // 3. Perform X3DH calculations
+  const dh1 = computeDH(
+    ownIdentityState.dhKeyPair.privateKey,
+    preKeyBundle.signedPreKey
+  );
+  const dh2 = computeDH(ephemeralKeyPair.privateKey, preKeyBundle.identityKey);
+  const dh3 = computeDH(ephemeralKeyPair.privateKey, preKeyBundle.signedPreKey);
+  const dh4 = computeDH(ephemeralKeyPair.privateKey, preKeyBundle.preKey);
+
+  // 4. Combine DH outputs -> Shared Secret (SK)
+  const sharedSecretInput = concatBuffers(dh1, dh2, dh3, dh4);
+
+  // 5. Derive initial Root Key from SK using HKDF
+  const initialKeys = await hkdfDerive(
+    sharedSecretInput,
+    null,
+    INFO_RATCHET,
+    1
+  );
+  const initialRootKey = await importHmacKey(initialKeys[0]);
+
+  // 6. Generate our first ratchet key pair
+  const initialRatchetKeyPair = generateECDHKeyPair();
+
+  // 7. Initial "enhanced" private key is just the normal private key
+  const initialEnhancedPrivateKey = initialRatchetKeyPair.privateKey;
+
+  // 8. Initial State Setup
+  const initialState: RatchetState = {
+    identityPrivateKey: ownIdentityState.dhKeyPair.privateKey,
+    identityPublicKey: ownIdentityState.dhKeyPair.publicKey,
+    remoteIdentityKey: preKeyBundle.identityKey,
+    remoteSigningKey: preKeyBundle.signingKey,
+    rootKey: initialRootKey,
+    ourRatchetKeyPair: initialRatchetKeyPair,
+    theirRatchetKey: null, // Set by first received message
+    ourEnhancedPrivateKey: initialEnhancedPrivateKey,
+    sendingChain: null,
+    receivingChain: null,
+    sendMsgCounter: 0,
+    recvMsgCounter: 0,
+    prevSendMsgCounter: 0,
+    skippedRatchetKeys: new Map(),
+  };
+  return initialState;
+}
+
+/**
+ * Initializes the RatchetState for the receiver using the first PreKey message.
+ * Uses noble-curves for EC operations.
+ * @param ownIdentityState Our identity information (needs pre-keys).
+ * @param preKeyMessage The received PreKey message.
+ * @returns A Promise resolving to the initial RatchetState for the receiver.
+ */
+export async function initializeRatchetReceiver(
+  ownIdentityState: IdentityState,
+  preKeyMessage: RatchetMessage
+): Promise<RatchetState> {
+  // 1. Validate PreKey message structure
+  if (
+    preKeyMessage.type !== MessageType.PRE_KEY ||
+    !preKeyMessage.identityKey ||
+    !preKeyMessage.header.publicKey ||
+    preKeyMessage.preKeyId === undefined ||
+    preKeyMessage.signedPreKeyId === undefined
+  ) {
+    throw new Error("Invalid PreKey message structure for initialization.");
+  }
+
+  // 2. Retrieve our necessary private keys
+  const ownSignedPreKeyPair = await getSignedPreKeyPair(
+    ownIdentityState,
+    preKeyMessage.signedPreKeyId
+  );
+  const ownPreKeyPair = await getOneTimePreKeyPair(
+    ownIdentityState,
+    preKeyMessage.preKeyId
+  );
+  if (!ownSignedPreKeyPair || !ownPreKeyPair) {
+    throw new Error(
+      `Required pre-key (ID ${preKeyMessage.preKeyId}) or signed pre-key (ID ${preKeyMessage.signedPreKeyId}) not found.`
+    );
+  }
+
+  // 3. Perform X3DH calculations
+  const dh1 = computeDH(
+    ownSignedPreKeyPair.privateKey,
+    preKeyMessage.identityKey
+  );
+  const dh2 = computeDH(
+    ownIdentityState.dhKeyPair.privateKey,
+    preKeyMessage.header.publicKey
+  );
+  const dh3 = computeDH(
+    ownSignedPreKeyPair.privateKey,
+    preKeyMessage.header.publicKey
+  );
+  const dh4 = computeDH(
+    ownPreKeyPair.privateKey,
+    preKeyMessage.header.publicKey
+  );
+
+  // 4. Combine DH outputs -> Shared Secret (SK)
+  const sharedSecretInput = concatBuffers(dh1, dh2, dh3, dh4);
+
+  // 5. Derive initial Root Key
+  const initialKeys = await hkdfDerive(
+    sharedSecretInput,
+    null,
+    INFO_RATCHET,
+    1
+  );
+  const initialRootKey = await importHmacKey(initialKeys[0]);
+
+  // 6. Initiator's ephemeral key is our first "theirRatchetKey"
+  const initialTheirRatchetKey = preKeyMessage.header.publicKey;
+
+  // 7. Generate our first ratchet key pair
+  const initialRatchetKeyPair = generateECDHKeyPair();
+
+  // 8. Initial "enhanced" private key is just the normal private key
+  const initialEnhancedPrivateKey = initialRatchetKeyPair.privateKey;
+
+  // 9. Initial State Setup (Placeholder for remote signing key)
+  const remoteSigningKey = preKeyMessage.identityKey; // Placeholder assumption
+
+  const initialState: RatchetState = {
+    identityPrivateKey: ownIdentityState.dhKeyPair.privateKey,
+    identityPublicKey: ownIdentityState.dhKeyPair.publicKey,
+    remoteIdentityKey: preKeyMessage.identityKey,
+    remoteSigningKey: remoteSigningKey,
+    rootKey: initialRootKey,
+    ourRatchetKeyPair: initialRatchetKeyPair,
+    theirRatchetKey: initialTheirRatchetKey,
+    ourEnhancedPrivateKey: initialEnhancedPrivateKey,
+    sendingChain: null,
+    receivingChain: null, // Will be created by first decrypt call
+    sendMsgCounter: 0,
+    recvMsgCounter: 0,
+    prevSendMsgCounter: 0,
+    skippedRatchetKeys: new Map(),
+  };
+  return initialState;
+}
+
+// --- Encryption Logic ---
+
+/**
+ * Encrypts a plaintext message using the current RatchetState.
+ * Handles DH ratchet updates and Triple Ratchet enhancement.
+ * @param currentState The current RatchetState.
+ * @param plaintext The plaintext ArrayBuffer to encrypt.
+ * @returns A Promise resolving to { message: RatchetMessage, nextState: RatchetState }.
+ */
+export async function ratchetEncrypt(
+  currentState: RatchetState,
+  plaintext: ArrayBuffer
+): Promise<{ message: RatchetMessage; nextState: RatchetState }> {
+  let nextState = { ...currentState };
+  let sendingChain = nextState.sendingChain;
+  let currentRatchetKeyPair = nextState.ourRatchetKeyPair; // Key pair used for DH/header
+
+  // --- DH Ratchet Step (if needed) ---
+  if (!sendingChain) {
+    if (!nextState.theirRatchetKey) {
+      throw new Error("Cannot encrypt: Remote ratchet key not established.");
+    }
+
+    // DH calculation using the *current* enhanced private key
+    const dhOutput = computeDH(
+      nextState.ourEnhancedPrivateKey,
+      nextState.theirRatchetKey
+    );
+    const { newRootKey, newChainKey } = await performDHRatchetStep(
+      nextState.rootKey,
+      dhOutput
+    );
+
+    sendingChain = {
+      chainKey: newChainKey,
+      chainIndex: 0,
+      skippedMessageKeys: new Map(),
+    };
+    nextState.rootKey = newRootKey;
+    nextState.sendingChain = sendingChain;
+    nextState.sendMsgCounter = 0;
+
+    // --- Triple Ratchet Enhancement (Sender Side) ---
+    const nextRatchetKeyPair = generateECDHKeyPair(); // Generate next key pair
+    // Calculate enhanced version of *current* private key using the DH output
+    const nextEnhancedPrivateKey = calculateEnhancedPrivateKey(
+      // Now synchronous
+      currentRatchetKeyPair.privateKey,
+      dhOutput
+    );
+
+    // Update state with the *new* key pair and *new* enhanced key for the future
+    nextState.ourRatchetKeyPair = nextRatchetKeyPair;
+    nextState.ourEnhancedPrivateKey = nextEnhancedPrivateKey;
+  } // End DH Ratchet Step
+
+  // --- Symmetric Ratchet Step ---
+  if (!sendingChain)
+    throw new Error("Internal error: Sending chain not available.");
+
+  const currentSendCounter = nextState.sendMsgCounter;
+  const { messageKeys, nextChainState: updatedSendingChain } =
+    await getSymRatchetMessageKey(sendingChain, currentSendCounter);
+  nextState.sendingChain = updatedSendingChain;
+  nextState.sendMsgCounter = currentSendCounter + 1;
+
+  // --- AES Encryption ---
+  const headerPublicKey = currentRatchetKeyPair.publicKey; // Use key from before potential update
+  const aadBuffer = stringToBytes(
+    JSON.stringify({
+      // Example AAD
+      pk: bytesToHex(headerPublicKey),
+      pn: currentState.prevSendMsgCounter,
+      n: currentSendCounter,
+    })
+  );
+  const ciphertext = await encryptAES(
+    messageKeys.encKey,
+    plaintext,
+    messageKeys.iv,
+    aadBuffer
+  );
+
+  // --- Construct Message ---
+  const header: MessageHeader = {
+    publicKey: headerPublicKey,
+    previousCounter: currentState.prevSendMsgCounter,
+    messageCounter: currentSendCounter,
+  };
+  const isInitialMessage =
+    currentState.sendMsgCounter === 0 &&
+    currentState.prevSendMsgCounter === 0 &&
+    !currentState.receivingChain;
+  const message: RatchetMessage = {
+    type: isInitialMessage ? MessageType.PRE_KEY : MessageType.NORMAL,
+    header,
+    ciphertext,
+  };
+  if (message.type === MessageType.PRE_KEY) {
+    message.identityKey = nextState.identityPublicKey;
+    message.preKeyId = 0; // Placeholder
+    message.signedPreKeyId = 0; // Placeholder
+  }
+  return { message, nextState };
+}
+
+// --- Decryption Logic ---
+
+/**
+ * Creates a unique key for storing/retrieving skipped message keys based on header info.
+ * @param header The message header.
+ * @returns A unique string key.
+ */
+function getSkippedKeyLookupKey(header: MessageHeader): string {
+  const pkHex = bytesToHex(header.publicKey);
+  return `${header.messageCounter}:${pkHex}`;
+}
+
+/**
+ * Decrypts a received RatchetMessage using the current RatchetState.
+ * Handles DH ratchet updates, Triple Ratchet enhancement, and skipped keys.
+ * @param currentState The current RatchetState.
+ * @param message The received RatchetMessage.
+ * @returns A Promise resolving to { plaintext: ArrayBuffer, nextState: RatchetState }.
+ */
+export async function ratchetDecrypt(
+  currentState: RatchetState,
+  message: RatchetMessage
+): Promise<{ plaintext: ArrayBuffer; nextState: RatchetState }> {
+  let nextState = { ...currentState };
+  let plaintext: ArrayBuffer | null = null;
+
+  // --- Try Decrypting with Skipped Keys First ---
+  const skippedKeyLookup = getSkippedKeyLookupKey(message.header);
+  const skippedKeys = nextState.skippedRatchetKeys.get(skippedKeyLookup);
+  if (skippedKeys) {
+    console.debug(
+      `Decrypting message N=${message.header.messageCounter} using skipped key.`
+    );
+    const aadBuffer = stringToBytes(
+      JSON.stringify({
+        // Reconstruct AAD
+        pk: bytesToHex(message.header.publicKey),
+        pn: message.header.previousCounter,
+        n: message.header.messageCounter,
+      })
+    );
+    plaintext = await decryptAES(
+      skippedKeys.encKey,
+      message.ciphertext,
+      skippedKeys.iv,
+      aadBuffer
+    );
+    const updatedSkipped = new Map(nextState.skippedRatchetKeys);
+    updatedSkipped.delete(skippedKeyLookup);
+    nextState.skippedRatchetKeys = updatedSkipped;
+    return { plaintext, nextState };
+  }
+
+  // --- Check for DH Ratchet Step ---
+  let receivingChain = nextState.receivingChain;
+  let performDH = false;
+  if (
+    !receivingChain ||
+    (nextState.theirRatchetKey &&
+      !equalPublicKeys(nextState.theirRatchetKey, message.header.publicKey))
+  ) {
+    performDH = true;
+  }
+
+  if (performDH) {
+    console.debug(
+      `Performing DH ratchet step for received message N=${message.header.messageCounter}.`
+    );
+    // --- Store Skipped Message Keys from Old Chain ---
+    if (receivingChain && nextState.theirRatchetKey) {
+      const oldSkipped = new Map(nextState.skippedRatchetKeys);
+      const currentChainIndex = receivingChain.chainIndex;
+      const numToSkip = Math.min(message.header.previousCounter, MAX_SKIP);
+      const oldRemotePubKey = nextState.theirRatchetKey;
+      for (const [idx, keys] of receivingChain.skippedMessageKeys.entries()) {
+        const headerKey = getSkippedKeyLookupKey({
+          publicKey: oldRemotePubKey,
+          previousCounter: 0,
+          messageCounter: idx,
+        });
+        oldSkipped.set(headerKey, keys);
+      }
+      let tempChainKey = receivingChain.chainKey;
+      for (let i = currentChainIndex; i < numToSkip; i++) {
+        const keys = await deriveMessageKeysFromChainKey(tempChainKey);
+        const headerKey = getSkippedKeyLookupKey({
+          publicKey: oldRemotePubKey,
+          previousCounter: 0,
+          messageCounter: i,
+        });
+        oldSkipped.set(headerKey, keys);
+        tempChainKey = await advanceChainKey(tempChainKey);
+      }
+      nextState.skippedRatchetKeys = oldSkipped;
+    } // End storing skipped keys
+
+    // --- Perform DH Ratchet Calculation ---
+    const dhOutput = computeDH(
+      nextState.ourEnhancedPrivateKey,
+      message.header.publicKey
+    );
+    const { newRootKey, newChainKey } = await performDHRatchetStep(
+      nextState.rootKey,
+      dhOutput
+    );
+
+    receivingChain = {
+      chainKey: newChainKey,
+      chainIndex: 0,
+      skippedMessageKeys: new Map(),
+    };
+    nextState.rootKey = newRootKey;
+    nextState.receivingChain = receivingChain;
+    nextState.theirRatchetKey = message.header.publicKey;
+    nextState.recvMsgCounter = 0;
+
+    // --- Update Our Ratchet Key Pair (for next send) ---
+    const nextRatchetKeyPair = generateECDHKeyPair();
+
+    // --- Triple Ratchet Enhancement (Receiver Side) ---
+    const nextEnhancedPrivateKey = calculateEnhancedPrivateKey(
+      // Now synchronous
+      nextRatchetKeyPair.privateKey, // Use the *newly generated* private key
+      dhOutput
+    );
+
+    nextState.ourRatchetKeyPair = nextRatchetKeyPair;
+    nextState.ourEnhancedPrivateKey = nextEnhancedPrivateKey;
+    nextState.prevSendMsgCounter = nextState.sendMsgCounter;
+    nextState.sendMsgCounter = 0;
+    nextState.sendingChain = null;
+  } // End DH Ratchet Step
+
+  // --- Symmetric Ratchet Decryption ---
+  if (!receivingChain) {
+    throw new Error(
+      "Internal error: Receiving chain not available for decryption after DH check."
+    );
+  }
+
+  const { messageKeys, nextChainState: updatedReceivingChain } =
+    await getSymRatchetMessageKey(
+      receivingChain,
+      message.header.messageCounter
+    );
+  nextState.receivingChain = updatedReceivingChain;
+
+  // --- AES Decryption ---
+  const aadBuffer = stringToBytes(
+    JSON.stringify({
+      // Reconstruct AAD
+      pk: bytesToHex(message.header.publicKey),
+      pn: message.header.previousCounter,
+      n: message.header.messageCounter,
+    })
+  );
+  plaintext = await decryptAES(
+    messageKeys.encKey,
+    message.ciphertext,
+    messageKeys.iv,
+    aadBuffer
+  );
+
+  if (plaintext === null) {
+    throw new Error("Decryption succeeded but plaintext is null.");
+  }
+  return { plaintext, nextState };
+}
+
+// --- Identity and Key Management ---
+const LS_SIGNED_PREKEY_PREFIX = "signedPreKey";
+const LS_ONETIME_PREKEY_PREFIX = "oneTimePreKey";
+
+interface StorableKeyPair {
+  publicKeyHex: string;
+  privateKeyHex: string;
+}
+
+/**
+ * Serializes an ECKeyPair (with Uint8Array keys) into a hex-based object for storage.
+ */
+function serializeKeyPair(keyPair: ECKeyPair): StorableKeyPair {
+  return {
+    publicKeyHex: bytesToHex(keyPair.publicKey),
+    privateKeyHex: bytesToHex(keyPair.privateKey),
+  };
+}
+
+/**
+ * Deserializes a hex-based object back into an ECKeyPair (with Uint8Array keys).
+ */
+function deserializeKeyPair(storable: StorableKeyPair): ECKeyPair {
+  if (
+    !storable ||
+    typeof storable.publicKeyHex !== "string" ||
+    typeof storable.privateKeyHex !== "string"
+  ) {
+    throw new Error("Invalid storable key pair format");
+  }
+  return {
+    publicKey: hexToBytes(storable.publicKeyHex),
+    privateKey: hexToBytes(storable.privateKeyHex),
+  };
+}
+
+/**
+ * Saves a signed pre-key pair to localStorage.
+ */
+export function saveSignedPreKey(
+  userId: number,
+  keyId: number,
+  keyPair: ECKeyPair
+): void {
+  try {
+    const storageKey = `${LS_SIGNED_PREKEY_PREFIX}:${userId}:${keyId}`;
+    const storable = serializeKeyPair(keyPair);
+    localStorage.setItem(storageKey, JSON.stringify(storable));
+    console.log(
+      `[LocalStorage] Saved Signed PreKey ID: ${keyId} for User ID: ${userId}`
+    );
+  } catch (e) {
+    console.error(
+      `[LocalStorage] Failed to save Signed PreKey ID: ${keyId}`,
+      e
+    );
+  }
+}
+
+/**
+ * Saves a one-time pre-key pair to localStorage.
+ */
+export function saveOneTimePreKey(
+  userId: number,
+  keyId: number,
+  keyPair: ECKeyPair
+): void {
+  try {
+    const storageKey = `${LS_ONETIME_PREKEY_PREFIX}:${userId}:${keyId}`;
+    const storable = serializeKeyPair(keyPair);
+    localStorage.setItem(storageKey, JSON.stringify(storable));
+    console.log(
+      `[LocalStorage] Saved One-Time PreKey ID: ${keyId} for User ID: ${userId}`
+    );
+  } catch (e) {
+    console.error(
+      `[LocalStorage] Failed to save One-Time PreKey ID: ${keyId}`,
+      e
+    );
+  }
+}
+
+/**
+ * Retrieves a signed pre-key pair from localStorage.
+ * Assumes the key format defined above.
+ *
+ * @param identityState - The state of the identity requesting the key (used to get userId).
+ * @param keyId - The ID of the signed pre-key to retrieve.
+ * @returns A Promise resolving to the ECKeyPair or null if not found/error.
+ */
+export async function getSignedPreKeyPair(
+  identityState: IdentityState, // Assuming IdentityState has an 'id' field
+  keyId: number
+): Promise<ECKeyPair | null> {
+  const userId = identityState.id;
+  const storageKey = `${LS_SIGNED_PREKEY_PREFIX}:${userId}:${keyId}`;
+  console.log(
+    `[LocalStorage] Attempting to get Signed PreKey ID: ${keyId} for User ID: ${userId}`
+  );
+
+  try {
+    const storedItem = localStorage.getItem(storageKey);
+    if (!storedItem) {
+      console.warn(`[LocalStorage] Signed PreKey ID: ${keyId} not found.`);
+      return null;
+    }
+
+    const storable: StorableKeyPair = JSON.parse(storedItem);
+    const keyPair = deserializeKeyPair(storable);
+    console.log(`[LocalStorage] Found Signed PreKey ID: ${keyId}.`);
+    return keyPair;
+  } catch (error) {
+    console.error(
+      `[LocalStorage] Error retrieving Signed PreKey ID: ${keyId}`,
+      error
+    );
+    return null;
+  }
+}
+
+/**
+ * Retrieves AND REMOVES a one-time pre-key pair from localStorage.
+ * Assumes the key format defined above. Simulates one-time use.
+ *
+ * @param identityState - The state of the identity requesting the key (used to get userId).
+ * @param keyId - The ID of the one-time pre-key to retrieve and remove.
+ * @returns A Promise resolving to the ECKeyPair or null if not found/error.
+ */
+export async function getOneTimePreKeyPair(
+  identityState: IdentityState, // Assuming IdentityState has an 'id' field
+  keyId: number
+): Promise<ECKeyPair | null> {
+  const userId = identityState.id;
+  const storageKey = `${LS_ONETIME_PREKEY_PREFIX}:${userId}:${keyId}`;
+  console.log(
+    `[LocalStorage] Attempting to get OT PreKey ID: ${keyId} for User ID: ${userId}`
+  );
+
+  try {
+    const storedItem = localStorage.getItem(storageKey);
+    if (!storedItem) {
+      console.warn(`[LocalStorage] OT PreKey ID: ${keyId} not found.`);
+      return null;
+    }
+
+    // Key found, now remove it *before* returning to simulate one-time use reliably
+    localStorage.removeItem(storageKey);
+    console.log(`[LocalStorage] Found and REMOVED OT PreKey ID: ${keyId}.`);
+
+    // Parse and deserialize the retrieved item
+    const storable: StorableKeyPair = JSON.parse(storedItem);
+    const keyPair = deserializeKeyPair(storable);
+    return keyPair;
+  } catch (error) {
+    console.error(
+      `[LocalStorage] Error retrieving/removing OT PreKey ID: ${keyId}`,
+      error
+    );
+    // If there was an error *after* removal, the key is lost.
+    // Depending on requirements, you might try to re-save it or handle differently.
+    return null;
+  }
+}
+
+/**
+ * Creates a PreKeyBundle for a given identity state.
+ *
+ * @param identityState The identity state to create a bundle for
+ * @param signedPreKeyId The ID of the signed pre-key to include
+ * @param preKeyId The ID of the one-time pre-key to include
+ * @returns The generated PreKeyBundle
+ */
+export async function createPreKeyBundle(
+  identityState: IdentityState,
+  signedPreKeyId: number,
+  preKeyId: number
+): Promise<PreKeyBundle> {
+  // Get the signed pre-key from the identity state
+  const signedPreKey = identityState.signedPreKeys.get(signedPreKeyId);
+  if (!signedPreKey) {
+    throw new Error(`Signed pre-key with ID ${signedPreKeyId} not found`);
+  }
+
+  // Get the pre-key from the identity state
+  const preKey = identityState.preKeys.get(preKeyId);
+  if (!preKey) {
+    throw new Error(`Pre-key with ID ${preKeyId} not found`);
+  }
+
+  // Get the signature for the signed pre-key
+  const signedPreKeySignature =
+    identityState.signedPreKeySignatures.get(signedPreKeyId);
+  if (!signedPreKeySignature) {
+    throw new Error(`Signature for signed pre-key ${signedPreKeyId} not found`);
+  }
+
+  // Create the PreKeyBundle
+  const bundle: PreKeyBundle = {
+    identityId: identityState.id,
+    identityKey: identityState.dhKeyPair.publicKey,
+    signedPreKeyId: signedPreKeyId,
+    signedPreKey: signedPreKey.publicKey,
+    signedPreKeySignature: signedPreKeySignature,
+    preKeyId: preKeyId,
+    preKey: preKey.publicKey,
+    signingKey: identityState.signingKeyPair.publicKey,
+  };
+
+  return bundle;
+}
+
+/**
+ * Creates and initializes a new identity state with pre-keys.
+ *
+ * @param userId The user ID for the identity
+ * @param numPreKeys The number of one-time pre-keys to generate
+ * @returns The initialized identity state
+ */
+export async function createIdentityState(
+  userId: number,
+  numPreKeys: number = 10
+): Promise<IdentityState> {
+  // Generate identity key pairs
+  const dhKeyPair = generateECDHKeyPair();
+  const signingKeyPair = generateECDHKeyPair(); // Using ECDH function for simplicity
+
+  // Initialize maps for pre-keys
+  const preKeys = new Map<number, ECKeyPair>();
+  const signedPreKeys = new Map<number, ECKeyPair>();
+  const signedPreKeySignatures = new Map<number, Uint8Array>();
+
+  // Generate signed pre-key (just one for simplicity)
+  const signedPreKeyId = 0;
+  const signedPreKeyPair = generateECDHKeyPair();
+  signedPreKeys.set(signedPreKeyId, signedPreKeyPair);
+
+  // Sign the signed pre-key
+  const signedPreKeySignature = await signData(
+    signingKeyPair.privateKey,
+    signedPreKeyPair.publicKey
+  );
+  signedPreKeySignatures.set(signedPreKeyId, signedPreKeySignature);
+
+  // Generate one-time pre-keys
+  for (let i = 0; i < numPreKeys; i++) {
+    const preKeyPair = generateECDHKeyPair();
+    preKeys.set(i, preKeyPair);
+
+    // Save to localStorage for persistence
+    saveOneTimePreKey(userId, i, preKeyPair);
+  }
+
+  // Save signed pre-key to localStorage
+  saveSignedPreKey(userId, signedPreKeyId, signedPreKeyPair);
+
+  // Create the identity state
+  const identityState: IdentityState = {
+    id: userId,
+    dhKeyPair,
+    signingKeyPair,
+    preKeys,
+    signedPreKeys,
+    signedPreKeySignatures,
+  };
+
+  return identityState;
+}
+
+```
+
+```test\triple-ratchet-test.ts
+// === File: src/test/triple-ratchet-test.ts ===
+
+import {
+  createIdentityState,
+  createPreKeyBundle,
+  initializeRatchetInitiator,
+  initializeRatchetReceiver,
+  ratchetEncrypt,
+  ratchetDecrypt,
+} from "../protocol/ratchet-logic";
+import { bytesToString, stringToBytes } from "../utils/buffer";
+import type { IdentityState, RatchetState, PreKeyBundle } from "../types";
+
+/**
+ * A class to test the Triple Ratchet protocol implementation end-to-end.
+ * This demonstrates the full flow of secure communication using the protocol.
+ */
+export class TripleRatchetTest {
+  private aliceIdentity!: IdentityState;
+  private bobIdentity!: IdentityState;
+  private aliceState!: RatchetState;
+  private bobState!: RatchetState;
+  private bobPreKeyBundle!: PreKeyBundle;
+  private messagesFromAlice: string[] = [];
+  private messageFromBob: string[] = [];
+
+  /**
+   * Initialize test identities and states for both parties.
+   */
+  public async setup(): Promise<void> {
+    console.log("=== Setting up Triple Ratchet Test ===");
+
+    try {
+      // Step 1: Create identities for Alice and Bob
+      console.log("Creating identities for Alice and Bob...");
+      this.aliceIdentity = await createIdentityState(1); // Alice is user 1
+      this.bobIdentity = await createIdentityState(2); // Bob is user 2
+
+      // Step 2: Create Bob's PreKeyBundle (that would normally be published on a server)
+      console.log("Creating Bob's PreKeyBundle...");
+      this.bobPreKeyBundle = await createPreKeyBundle(this.bobIdentity, 0, 0);
+
+      // Step 3: Alice initializes a session with Bob using his bundle
+      console.log("Alice initializing session with Bob...");
+      this.aliceState = await initializeRatchetInitiator(
+        this.aliceIdentity,
+        this.bobPreKeyBundle
+      );
+
+      console.log("Setup complete!");
+    } catch (error) {
+      console.error("Error during setup:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Alice sends a first message to Bob, which establishes the session on Bob's side
+   * @param message The message text to send
+   */
+  public async aliceSendsFirstMessage(message: string): Promise<void> {
+    console.log("\n=== Alice Sends First Message ===");
+
+    try {
+      // Step 1: Alice encrypts her first message (this will be a PreKey message)
+      console.log(`Alice encrypting: "${message}"`);
+      const plaintext = stringToBytes(message);
+      const { message: encryptedMessage, nextState } = await ratchetEncrypt(
+        this.aliceState,
+        plaintext
+      );
+
+      // Update Alice's state
+      this.aliceState = nextState;
+
+      // Step 2: Bob receives the PreKey message and initializes his session
+      console.log("Bob receiving and initializing his session...");
+      this.bobState = await initializeRatchetReceiver(
+        this.bobIdentity,
+        encryptedMessage
+      );
+
+      // Step 3: Bob decrypts the message
+      console.log("Bob decrypting the message...");
+      const { plaintext: decryptedPlaintext, nextState: bobNextState } =
+        await ratchetDecrypt(this.bobState, encryptedMessage);
+
+      // Update Bob's state
+      this.bobState = bobNextState;
+
+      // Step 4: Convert the decrypted message to a string
+      const decryptedMessage = bytesToString(decryptedPlaintext);
+      console.log(`Bob decrypted: "${decryptedMessage}"`);
+
+      // Store for verification
+      this.messagesFromAlice.push(message);
+
+      if (message === decryptedMessage) {
+        console.log("First message successfully sent and received!");
+      } else {
+        console.error("Decryption failed: messages don't match!");
+      }
+    } catch (error) {
+      console.error("Error in aliceSendsFirstMessage:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Alice sends subsequent messages to Bob (after the session is established)
+   * @param message The message text to send
+   */
+  public async aliceSendsMessage(message: string): Promise<void> {
+    console.log("\n=== Alice Sends Message ===");
+
+    try {
+      // Step 1: Alice encrypts her message
+      console.log(`Alice encrypting: "${message}"`);
+      const plaintext = stringToBytes(message);
+      const { message: encryptedMessage, nextState } = await ratchetEncrypt(
+        this.aliceState,
+        plaintext
+      );
+
+      // Update Alice's state
+      this.aliceState = nextState;
+
+      // Step 2: Bob decrypts the message
+      console.log("Bob decrypting the message...");
+      const { plaintext: decryptedPlaintext, nextState: bobNextState } =
+        await ratchetDecrypt(this.bobState, encryptedMessage);
+
+      // Update Bob's state
+      this.bobState = bobNextState;
+
+      // Step 3: Convert the decrypted message to a string
+      const decryptedMessage = bytesToString(decryptedPlaintext);
+      console.log(`Bob decrypted: "${decryptedMessage}"`);
+
+      // Store for verification
+      this.messagesFromAlice.push(message);
+
+      if (message === decryptedMessage) {
+        console.log("Message successfully sent and received!");
+      } else {
+        console.error("Decryption failed: messages don't match!");
+      }
+    } catch (error) {
+      console.error("Error in aliceSendsMessage:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Bob sends a message to Alice
+   * @param message The message text to send
+   */
+  public async bobSendsMessage(message: string): Promise<void> {
+    console.log("\n=== Bob Sends Message ===");
+
+    try {
+      // Step 1: Bob encrypts his message
+      console.log(`Bob encrypting: "${message}"`);
+      const plaintext = stringToBytes(message);
+      const { message: encryptedMessage, nextState } = await ratchetEncrypt(
+        this.bobState,
+        plaintext
+      );
+
+      // Update Bob's state
+      this.bobState = nextState;
+
+      // Step 2: Alice decrypts the message
+      console.log("Alice decrypting the message...");
+      const { plaintext: decryptedPlaintext, nextState: aliceNextState } =
+        await ratchetDecrypt(this.aliceState, encryptedMessage);
+
+      // Update Alice's state
+      this.aliceState = aliceNextState;
+
+      // Step 3: Convert the decrypted message to a string
+      const decryptedMessage = bytesToString(decryptedPlaintext);
+      console.log(`Alice decrypted: "${decryptedMessage}"`);
+
+      // Store for verification
+      this.messageFromBob.push(message);
+
+      if (message === decryptedMessage) {
+        console.log("Message successfully sent and received!");
+      } else {
+        console.error("Decryption failed: messages don't match!");
+      }
+    } catch (error) {
+      console.error("Error in bobSendsMessage:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Demonstrates key rotation by sending multiple messages back and forth
+   * This shows the forward secrecy and break-in recovery properties
+   */
+  public async demonstrateKeyRotation(messageCount: number = 5): Promise<void> {
+    console.log("\n=== Demonstrating Key Rotation ===");
+    console.log(
+      `Sending ${messageCount} messages in each direction to trigger ratchet turns...`
+    );
+
+    try {
+      // Alice and Bob alternate sending messages
+      for (let i = 0; i < messageCount; i++) {
+        // Alice sends message to Bob
+        const aliceMessage = `Alice's message #${i + 1}: Hello Bob!`;
+        await this.aliceSendsMessage(aliceMessage);
+
+        // Bob sends message to Alice
+        const bobMessage = `Bob's message #${i + 1}: Hello Alice!`;
+        await this.bobSendsMessage(bobMessage);
+
+        console.log(`Completed round ${i + 1} of message exchange`);
+
+        // Log some state information to show changes
+        console.log(`Alice's send counter: ${this.aliceState.sendMsgCounter}`);
+        console.log(`Bob's send counter: ${this.bobState.sendMsgCounter}`);
+      }
+
+      console.log("\nKey rotation demonstration complete!");
+      console.log(
+        "The Triple Ratchet protocol has successfully maintained secure communication"
+      );
+      console.log(
+        "with automatic key rotation for forward secrecy and break-in recovery."
+      );
+    } catch (error) {
+      console.error("Error in demonstrateKeyRotation:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Demonstrates the out-of-order message handling capability
+   */
+  public async demonstrateOutOfOrderMessages(): Promise<void> {
+    console.log("\n=== Demonstrating Out-of-Order Message Handling ===");
+
+    try {
+      // Alice encrypts three messages in sequence
+      console.log("Alice encrypting three messages in sequence...");
+      const message1 = "Message 1: This should arrive first";
+      const message2 = "Message 2: This should arrive second";
+      const message3 = "Message 3: This should arrive third";
+
+      // Encrypt all three messages
+      const plaintext1 = stringToBytes(message1);
+      const { message: encryptedMessage1, nextState: aliceState1 } =
+        await ratchetEncrypt(this.aliceState, plaintext1);
+
+      // Update Alice's state for the next message
+      const aliceStateAfterMsg1 = aliceState1;
+
+      const plaintext2 = stringToBytes(message2);
+      const { message: encryptedMessage2, nextState: aliceState2 } =
+        await ratchetEncrypt(aliceStateAfterMsg1, plaintext2);
+
+      // Update Alice's state for the next message
+      const aliceStateAfterMsg2 = aliceState2;
+
+      const plaintext3 = stringToBytes(message3);
+      const { message: encryptedMessage3, nextState: aliceState3 } =
+        await ratchetEncrypt(aliceStateAfterMsg2, plaintext3);
+
+      // Update Alice's final state
+      this.aliceState = aliceState3;
+
+      // Bob receives the messages out of order: 3, 1, 2
+      console.log(
+        "Bob receiving and decrypting messages out of order: 3, 1, 2"
+      );
+
+      // Message 3 (received first)
+      console.log("Bob decrypting message 3 (received first)...");
+      const { plaintext: decryptedPlaintext3, nextState: bobStateAfterMsg3 } =
+        await ratchetDecrypt(this.bobState, encryptedMessage3);
+
+      // Update Bob's state
+      const bobStateAfterReceivingMsg3 = bobStateAfterMsg3;
+
+      // Message 1 (received second)
+      console.log("Bob decrypting message 1 (received second)...");
+      const { plaintext: decryptedPlaintext1, nextState: bobStateAfterMsg1 } =
+        await ratchetDecrypt(bobStateAfterReceivingMsg3, encryptedMessage1);
+
+      // Update Bob's state
+      const bobStateAfterReceivingMsg1 = bobStateAfterMsg1;
+
+      // Message 2 (received last)
+      console.log("Bob decrypting message 2 (received last)...");
+      const { plaintext: decryptedPlaintext2, nextState: bobStateAfterMsg2 } =
+        await ratchetDecrypt(bobStateAfterReceivingMsg1, encryptedMessage2);
+
+      // Update Bob's final state
+      this.bobState = bobStateAfterMsg2;
+
+      // Check if all messages were decrypted correctly
+      const decryptedMessage1 = bytesToString(decryptedPlaintext1);
+      const decryptedMessage2 = bytesToString(decryptedPlaintext2);
+      const decryptedMessage3 = bytesToString(decryptedPlaintext3);
+
+      console.log("\nDecrypted messages:");
+      console.log(`Message 1: "${decryptedMessage1}"`);
+      console.log(`Message 2: "${decryptedMessage2}"`);
+      console.log(`Message 3: "${decryptedMessage3}"`);
+
+      if (
+        message1 === decryptedMessage1 &&
+        message2 === decryptedMessage2 &&
+        message3 === decryptedMessage3
+      ) {
+        console.log(
+          "\nAll messages successfully decrypted in the correct order!"
+        );
+        console.log(
+          "The Triple Ratchet protocol successfully handled out-of-order messages."
+        );
+      } else {
+        console.error("\nDecryption failed: some messages don't match!");
+      }
+    } catch (error) {
+      console.error("Error in demonstrateOutOfOrderMessages:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Run the complete test suite
+   */
+  public async runTest(): Promise<void> {
+    console.log("========================================");
+    console.log("      TRIPLE RATCHET TEST SUITE        ");
+    console.log("========================================");
+
+    try {
+      // Initialize test environment
+      await this.setup();
+
+      // Test the initial message exchange
+      await this.aliceSendsFirstMessage(
+        "Hello Bob! This is the first message."
+      );
+
+      // Test regular message exchange
+      await this.bobSendsMessage("Hi Alice! I received your message.");
+      await this.aliceSendsMessage("Great! Let's test our secure channel.");
+
+      // Test key rotation
+      await this.demonstrateKeyRotation(3);
+
+      // Test out-of-order message handling
+      await this.demonstrateOutOfOrderMessages();
+
+      console.log("\n========================================");
+      console.log("      TEST SUITE COMPLETED SUCCESSFULLY  ");
+      console.log("========================================");
+    } catch (error) {
+      console.error("\n========================================");
+      console.error("      TEST SUITE FAILED                ");
+      console.error("========================================");
+      console.error("Error:", error);
+    }
+  }
+}
+
+/**
+ * Run the test when this file is executed directly
+ */
+(async function () {
+  const test = new TripleRatchetTest();
+  await test.runTest();
+})();
+
+```
+
+```types\index.ts
+// === File: src/types/index.ts ===
+
+// Cryptographic key types using noble-curves format (Uint8Array) and Web Crypto
+export type ECDHPublicKey = Uint8Array; // Uncompressed or Compressed Point Bytes
+export type ECDHPrivateKey = Uint8Array; // 32-byte scalar
+export type ECDSAPublicKey = Uint8Array; // Uncompressed or Compressed Point Bytes
+export type ECDSAPrivateKey = Uint8Array; // 32-byte scalar
+export type HMACKey = CryptoKey; // Web Crypto API Key Object
+export type AESKey = CryptoKey; // Web Crypto API Key Object
+
+// Key pair types
+export interface ECKeyPair {
+  publicKey: ECDHPublicKey;
+  privateKey: ECDHPrivateKey;
+}
+
+export interface SigningKeyPair {
+  publicKey: ECDSAPublicKey;
+  privateKey: ECDSAPrivateKey;
+}
+
+// Serialized EC public key format (Using Hex for simplicity)
+export type SerializedECPublicKey = string; // Hex representation of public key bytes
+
+// Message types for the Triple Ratchet protocol
+export enum MessageType {
+  NORMAL = 0,
+  PRE_KEY = 1,
+}
+
+// A message header contains metadata for a ratchet message
+export interface MessageHeader {
+  publicKey: ECDHPublicKey; // Sender's ratchet public key (bytes)
+  previousCounter: number; // Number of messages in previous sending chain
+  messageCounter: number; // Message number in current chain
+}
+
+// A ratchet message contains the encrypted data and metadata
+export interface RatchetMessage {
+  type: MessageType;
+  header: MessageHeader;
+  ciphertext: ArrayBuffer;
+  // For PreKeyMessages only
+  identityKey?: ECDHPublicKey; // Sender's long-term identity key (bytes)
+  preKeyId?: number;
+  signedPreKeyId?: number;
+}
+
+// The message keys used for encryption/decryption
+export interface MessageKeys {
+  encKey: AESKey; // Web Crypto AES Key
+  authKey: HMACKey; // Web Crypto HMAC Key
+  iv: ArrayBuffer;
+}
+
+// A PreKeyBundle is used to establish initial communication
+export interface PreKeyBundle {
+  identityId: number;
+  identityKey: ECDHPublicKey; // bytes
+  signedPreKeyId: number;
+  signedPreKey: ECDHPublicKey; // bytes
+  signedPreKeySignature: Uint8Array; // Signature bytes
+  preKeyId: number;
+  preKey: ECDHPublicKey; // bytes
+  signingKey: ECDSAPublicKey; // Public signing key of the bundle owner (bytes)
+}
+
+// --- State Types for Functional Approach ---
+
+/**
+ * State for a symmetric key ratchet chain (sending or receiving)
+ */
+export interface RatchetChainState {
+  chainKey: HMACKey; // Web Crypto Key
+  chainIndex: number;
+  skippedMessageKeys: Map<number, MessageKeys>; // Stores keys for out-of-order messages
+}
+
+/**
+ * Represents the complete state of a Triple Ratchet session for one party
+ */
+export interface RatchetState {
+  // Own identity info (simplified for this example)
+  identityPrivateKey: ECDHPrivateKey; // bytes
+  identityPublicKey: ECDHPublicKey; // bytes
+
+  // Remote party's identity info
+  remoteIdentityKey: ECDHPublicKey; // bytes
+  remoteSigningKey: ECDSAPublicKey; // bytes
+
+  // Core Ratchet State
+  rootKey: HMACKey; // Web Crypto Key
+  ourRatchetKeyPair: ECKeyPair; // Our current ephemeral DH key pair (bytes)
+  theirRatchetKey: ECDHPublicKey | null; // Their current ephemeral DH public key (bytes)
+
+  // Triple Ratchet Enhancement
+  // This now holds the actual enhanced private key scalar bytes x_t' = x_t * H(I_t) mod q
+  ourEnhancedPrivateKey: ECDHPrivateKey; // bytes
+
+  // Symmetric Key Ratchet Chains
+  sendingChain: RatchetChainState | null;
+  receivingChain: RatchetChainState | null;
+
+  // Counters
+  sendMsgCounter: number; // Messages sent in the current sending chain
+  recvMsgCounter: number; // Messages received in the current receiving chain (Note: might not be needed if using chainIndex)
+  prevSendMsgCounter: number; // Number of messages sent in the *previous* sending chain
+
+  // Storage for message keys skipped during DH ratchet steps
+  // Key: Hex(remote public key) + message counter
+  skippedRatchetKeys: Map<string, MessageKeys>;
+}
+
+/**
+ * Represents the state of a user's identity keys (simplified)
+ */
+export interface IdentityState {
+  id: number;
+  signingKeyPair: SigningKeyPair; // bytes
+  dhKeyPair: ECKeyPair; // bytes
+  // Add maps for preKeys (ECKeyPair), signedPreKeys (ECKeyPair), signatures (Map<number, Uint8Array>) etc.
+  preKeys: Map<number, ECKeyPair>;
+  signedPreKeys: Map<number, ECKeyPair>;
+  signedPreKeySignatures: Map<number, Uint8Array>;
+}
+
+```
+
+```utils\buffer.ts
+// === File: src/utils/buffer.ts ===
+
+import {
+  bytesToHex as nobleBytesToHex,
+  hexToBytes as nobleHexToBytes,
+} from "@noble/hashes/utils";
+
+/**
+ * Concatenates multiple ArrayBuffers or Uint8Arrays.
+ * @param buffers ArrayBuffers or Uint8Arrays to concatenate.
+ * @returns A new Uint8Array containing the concatenated data.
+ */
+export function concatBuffers(
+  ...buffers: (ArrayBuffer | Uint8Array)[]
+): Uint8Array {
+  const totalLength = buffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+
+  for (const buffer of buffers) {
+    result.set(new Uint8Array(buffer), offset);
+    offset += buffer.byteLength;
+  }
+
+  return result;
+}
+
+/**
+ * Compares two ArrayBuffers or Uint8Arrays for equality.
+ * Uses constant time comparison if possible.
+ * @param a The first buffer.
+ * @param b The second buffer.
+ * @returns True if the buffers are identical, false otherwise.
+ */
+export function equalBuffers(
+  a: ArrayBuffer | Uint8Array,
+  b: ArrayBuffer | Uint8Array
+): boolean {
+  const viewA = new Uint8Array(a);
+  const viewB = new Uint8Array(b);
+
+  if (viewA.length !== viewB.length) {
+    return false;
+  }
+
+  // Constant time comparison
+  let diff = 0;
+  for (let i = 0; i < viewA.length; i++) {
+    diff |= viewA[i] ^ viewB[i];
+  }
+  return diff === 0;
+}
+
+// Use noble-hashes utilities for hex conversion and re-export
+export const bytesToHex = nobleBytesToHex;
+export const hexToBytes = nobleHexToBytes;
+
+/**
+ * Converts a UTF-8 string to an Uint8Array.
+ * @param str The string to encode.
+ * @returns The Uint8Array representation.
+ */
+export function stringToBytes(str: string): Uint8Array {
+  return new TextEncoder().encode(str);
+}
+
+/**
+ * Converts an ArrayBuffer or Uint8Array to a UTF-8 string.
+ * @param buffer The buffer to decode.
+ * @returns The decoded string.
+ */
+export function bytesToString(buffer: ArrayBuffer | Uint8Array): string {
+  return new TextDecoder().decode(buffer);
+}
+
+```
+
+```utils\environment.ts
+// === File: src/utils/environment.ts ===
+
+/**
+ * Environment detection utilities
+ */
+export const isBrowser =
+  typeof window !== "undefined" && typeof window.crypto !== "undefined";
+
+/**
+ * Gets the crypto implementation from the environment (for Web Crypto parts).
+ * @throws Error if Web Crypto API is not available.
+ * @returns The Crypto object.
+ */
+export function getCrypto(): Crypto {
+  if (isBrowser) {
+    return window.crypto;
+  }
+  throw new Error("Web Crypto API is not available in this environment");
+}
+
+```

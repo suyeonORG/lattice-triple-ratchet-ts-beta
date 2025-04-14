@@ -1,0 +1,1155 @@
+```constants.ts
+/**
+ * Triple Ratchet - Constants
+ */
+
+// Cryptographic algorithm constants
+export const CURVE_NAME = "P-256";
+export const HASH_ALGORITHM = "SHA-256";
+export const SIGNATURE_ALGORITHM = { name: "ECDSA", hash: { name: "SHA-256" } };
+export const HMAC_ALGORITHM = { name: "HMAC", hash: { name: "SHA-256" } };
+export const AES_ALGORITHM = { name: "AES-GCM", length: 256 };
+
+// Protocol constants
+export const INFO_RATCHET = new TextEncoder().encode("TripleRatchetInfo");
+export const MAX_SKIP = 100; // Maximum number of message keys to skip
+
+```
+
+```crypto\crypto-utils.ts
+/**
+ * Crypto utilities for the Triple Ratchet
+ */
+import {
+  CURVE_NAME,
+  SIGNATURE_ALGORITHM,
+  HMAC_ALGORITHM,
+  HASH_ALGORITHM,
+  AES_ALGORITHM,
+} from "../constants";
+import {
+  ECKeyPair,
+  SigningKeyPair,
+  ECDHPublicKey,
+  ECDHPrivateKey,
+  SerializedECPublicKey,
+  HMACKey,
+  AESKey,
+  ECDSAPrivateKey,
+  ECDSAPublicKey,
+} from "../types";
+import { getCrypto } from "../utils/environment";
+
+export class CryptoUtils {
+  /**
+   * Generates a new ECDH key pair
+   */
+  static async generateECDHKeyPair(): Promise<ECKeyPair> {
+    const crypto = getCrypto();
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDH", namedCurve: CURVE_NAME },
+      true,
+      ["deriveKey", "deriveBits"]
+    );
+
+    return {
+      publicKey: keyPair.publicKey,
+      privateKey: keyPair.privateKey,
+    };
+  }
+
+  /**
+   * Generates a new ECDSA signing key pair
+   */
+  static async generateSigningKeyPair(): Promise<SigningKeyPair> {
+    const crypto = getCrypto();
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: CURVE_NAME },
+      true,
+      ["sign", "verify"]
+    );
+
+    return {
+      publicKey: keyPair.publicKey,
+      privateKey: keyPair.privateKey,
+    };
+  }
+
+  /**
+   * Computes Diffie-Hellman shared secret
+   */
+  static async computeDH(
+    privateKey: ECDHPrivateKey,
+    publicKey: ECDHPublicKey
+  ): Promise<ArrayBuffer> {
+    const crypto = getCrypto();
+    return crypto.subtle.deriveBits(
+      { name: "ECDH", public: publicKey },
+      privateKey,
+      256
+    );
+  }
+
+  /**
+   * Derives keys using HKDF
+   */
+  static async hkdf(
+    input: ArrayBuffer,
+    salt: ArrayBuffer | null,
+    info: ArrayBuffer,
+    keyCount: number
+  ): Promise<ArrayBuffer[]> {
+    const crypto = getCrypto();
+
+    // HKDF-Extract
+    const prk = await crypto.subtle.importKey(
+      "raw",
+      salt || new Uint8Array(32),
+      HMAC_ALGORITHM,
+      false,
+      ["sign"]
+    );
+
+    const extractedKey = await crypto.subtle.sign(
+      HMAC_ALGORITHM.name,
+      prk,
+      input
+    );
+
+    // HKDF-Expand
+    const hmacKey = await crypto.subtle.importKey(
+      "raw",
+      extractedKey,
+      HMAC_ALGORITHM,
+      false,
+      ["sign"]
+    );
+
+    const result: ArrayBuffer[] = [];
+    let t = new Uint8Array(0);
+
+    for (let i = 0; i < keyCount; i++) {
+      const data = new Uint8Array(t.length + info.byteLength + 1);
+      data.set(new Uint8Array(t), 0);
+      data.set(new Uint8Array(info), t.length);
+      data[data.length - 1] = i + 1;
+
+      t = await crypto.subtle.sign(HMAC_ALGORITHM.name, hmacKey, data);
+
+      result.push(t.slice(0, 32));
+    }
+
+    return result;
+  }
+
+  /**
+   * Imports a raw key as HMAC key
+   */
+  static async importHmacKey(keyData: ArrayBuffer): Promise<HMACKey> {
+    const crypto = getCrypto();
+    return crypto.subtle.importKey("raw", keyData, HMAC_ALGORITHM, false, [
+      "sign",
+      "verify",
+    ]);
+  }
+
+  /**
+   * Imports a raw key as AES key
+   */
+  static async importAesKey(keyData: ArrayBuffer): Promise<AESKey> {
+    const crypto = getCrypto();
+    return crypto.subtle.importKey("raw", keyData, AES_ALGORITHM, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+  }
+
+  /**
+   * Signs data with a private key
+   */
+  static async sign(
+    privateKey: ECDSAPrivateKey,
+    data: ArrayBuffer
+  ): Promise<ArrayBuffer> {
+    const crypto = getCrypto();
+    return crypto.subtle.sign(SIGNATURE_ALGORITHM, privateKey, data);
+  }
+
+  /**
+   * Verifies a signature
+   */
+  static async verify(
+    publicKey: ECDSAPublicKey,
+    signature: ArrayBuffer,
+    data: ArrayBuffer
+  ): Promise<boolean> {
+    const crypto = getCrypto();
+    return crypto.subtle.verify(
+      SIGNATURE_ALGORITHM,
+      publicKey,
+      signature,
+      data
+    );
+  }
+
+  /**
+   * Serializes an EC public key to x,y coordinates
+   */
+  static async serializePublicKey(
+    publicKey: ECDHPublicKey
+  ): Promise<SerializedECPublicKey> {
+    const crypto = getCrypto();
+    const exported = await crypto.subtle.exportKey("jwk", publicKey);
+    return {
+      x: exported.x!,
+      y: exported.y!,
+    };
+  }
+
+  /**
+   * Creates an EC public key from serialized coordinates
+   */
+  static async deserializePublicKey(
+    serialized: SerializedECPublicKey,
+    usage: "ECDH" | "ECDSA"
+  ): Promise<CryptoKey> {
+    const crypto = getCrypto();
+    const jwk = {
+      kty: "EC",
+      crv: CURVE_NAME,
+      x: serialized.x,
+      y: serialized.y,
+      ext: true,
+    };
+
+    const keyUsages: KeyUsage[] = usage === "ECDH" ? [] : ["verify"];
+
+    return crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: usage, namedCurve: CURVE_NAME },
+      true,
+      keyUsages
+    );
+  }
+
+  /**
+   * Computes a SHA-256 hash
+   */
+  static async hash(data: ArrayBuffer): Promise<ArrayBuffer> {
+    const crypto = getCrypto();
+    return crypto.subtle.digest(HASH_ALGORITHM, data);
+  }
+
+  /**
+   * Encrypts data with AES-GCM
+   */
+  static async encrypt(
+    key: AESKey,
+    data: ArrayBuffer,
+    iv: ArrayBuffer
+  ): Promise<ArrayBuffer> {
+    const crypto = getCrypto();
+    return crypto.subtle.encrypt(
+      {
+        name: AES_ALGORITHM.name,
+        iv: new Uint8Array(iv),
+      },
+      key,
+      data
+    );
+  }
+
+  /**
+   * Decrypts data with AES-GCM
+   */
+  static async decrypt(
+    key: AESKey,
+    data: ArrayBuffer,
+    iv: ArrayBuffer
+  ): Promise<ArrayBuffer> {
+    const crypto = getCrypto();
+    return crypto.subtle.decrypt(
+      {
+        name: AES_ALGORITHM.name,
+        iv: new Uint8Array(iv),
+      },
+      key,
+      data
+    );
+  }
+}
+
+```
+
+```crypto\curve.tsx
+
+```
+
+```protocol\chain-key.ts
+/**
+ * Chain Key implementation for the Triple Ratchet
+ */
+import { CryptoUtils } from "../crypto/crypto-utils";
+import { HMACKey, MessageKeys } from "../types";
+import { HMAC_ALGORITHM, INFO_RATCHET } from "../constants";
+import { getCrypto } from "../utils/environment";
+
+/**
+ * A chain key is used to derive message keys
+ */
+export class ChainKey {
+  key: HMACKey;
+  index: number;
+
+  constructor(key: HMACKey, index: number) {
+    this.key = key;
+    this.index = index;
+  }
+
+  /**
+   * Derives a message key from this chain key
+   */
+  async messageKey(): Promise<MessageKeys> {
+    const crypto = getCrypto();
+    const input = new TextEncoder().encode("MessageKey");
+    const output = await crypto.subtle.sign(
+      HMAC_ALGORITHM.name,
+      this.key,
+      input
+    );
+
+    const keys = await CryptoUtils.hkdf(output, null, INFO_RATCHET, 3);
+
+    return {
+      encKey: await CryptoUtils.importAesKey(keys[0]),
+      authKey: await CryptoUtils.importHmacKey(keys[1]),
+      iv: keys[2],
+    };
+  }
+
+  /**
+   * Returns the next chain key in the chain
+   */
+  async next(): Promise<ChainKey> {
+    const crypto = getCrypto();
+    const input = new TextEncoder().encode("NextChainKey");
+    const output = await crypto.subtle.sign(
+      HMAC_ALGORITHM.name,
+      this.key,
+      input
+    );
+
+    const nextKey = await CryptoUtils.importHmacKey(output);
+    return new ChainKey(nextKey, this.index + 1);
+  }
+}
+
+```
+
+```protocol\identity.ts
+/**
+ * Identity implementation for the Triple Ratchet
+ */
+import { CryptoUtils } from "../crypto/crypto-utils";
+import { BufferUtils } from "../utils/buffer";
+import { ECKeyPair, SigningKeyPair, PreKeyBundle } from "../types";
+
+/**
+ * Identity represents a user in the Triple Ratchet protocol
+ */
+export class Identity {
+  id: number;
+  signingKeyPair: SigningKeyPair;
+  dhKeyPair: ECKeyPair;
+  preKeys: Map<number, ECKeyPair>;
+  signedPreKeys: Map<number, ECKeyPair>;
+  signedPreKeySignatures: Map<number, ArrayBuffer>;
+  createdAt: Date;
+
+  private constructor(
+    id: number,
+    signingKeyPair: SigningKeyPair,
+    dhKeyPair: ECKeyPair
+  ) {
+    this.id = id;
+    this.signingKeyPair = signingKeyPair;
+    this.dhKeyPair = dhKeyPair;
+    this.preKeys = new Map();
+    this.signedPreKeys = new Map();
+    this.signedPreKeySignatures = new Map();
+    this.createdAt = new Date();
+  }
+
+  /**
+   * Creates a new identity
+   */
+  static async create(
+    id: number,
+    preKeyCount = 10,
+    signedPreKeyCount = 5
+  ): Promise<Identity> {
+    const signingKeyPair = await CryptoUtils.generateSigningKeyPair();
+    const dhKeyPair = await CryptoUtils.generateECDHKeyPair();
+
+    const identity = new Identity(id, signingKeyPair, dhKeyPair);
+
+    // Generate pre-keys
+    for (let i = 0; i < preKeyCount; i++) {
+      const keyPair = await CryptoUtils.generateECDHKeyPair();
+      identity.preKeys.set(i, keyPair);
+    }
+
+    // Generate signed pre-keys
+    for (let i = 0; i < signedPreKeyCount; i++) {
+      const keyPair = await CryptoUtils.generateECDHKeyPair();
+      identity.signedPreKeys.set(i, keyPair);
+
+      // Sign the public key
+      const serializedKey = await CryptoUtils.serializePublicKey(
+        keyPair.publicKey
+      );
+      const keyBytes = BufferUtils.fromHex(serializedKey.x + serializedKey.y);
+
+      const signature = await CryptoUtils.sign(
+        signingKeyPair.privateKey,
+        keyBytes
+      );
+
+      identity.signedPreKeySignatures.set(i, signature);
+    }
+
+    return identity;
+  }
+
+  /**
+   * Creates a PreKeyBundle for this identity
+   */
+  async createPreKeyBundle(
+    preKeyId: number,
+    signedPreKeyId: number
+  ): Promise<PreKeyBundle> {
+    const preKey = this.preKeys.get(preKeyId);
+    const signedPreKey = this.signedPreKeys.get(signedPreKeyId);
+    const signature = this.signedPreKeySignatures.get(signedPreKeyId);
+
+    if (!preKey || !signedPreKey || !signature) {
+      throw new Error("Invalid preKey or signedPreKey ID");
+    }
+
+    return {
+      identityId: this.id,
+      identityKey: this.dhKeyPair.publicKey,
+      signedPreKeyId,
+      signedPreKey: signedPreKey.publicKey,
+      signedPreKeySignature: signature,
+      preKeyId,
+      preKey: preKey.publicKey,
+      signingKey: this.signingKeyPair.publicKey,
+    };
+  }
+
+  /**
+   * Serializes the identity for storage
+   */
+  async serialize(): Promise<string> {
+    // In a real implementation, we would serialize all keys and data
+    // For demonstration purposes, we only serialize the ID
+    return JSON.stringify({ id: this.id });
+  }
+
+  /**
+   * Creates an identity from serialized data
+   */
+  static async deserialize(data: string): Promise<Identity> {
+    // In a real implementation, we would deserialize all keys and data
+    // For demonstration purposes, this is just a placeholder
+    const parsed = JSON.parse(data);
+    return await Identity.create(parsed.id);
+  }
+}
+
+```
+
+```protocol\symmetric-ratchet.ts
+/**
+ * Symmetric Ratchet implementation for the Triple Ratchet
+ */
+import { ChainKey } from "./chain-key";
+import { MessageKeys } from "../types";
+
+/**
+ * The SymmetricRatchet is used to derive message keys for sending/receiving
+ */
+export class SymmetricRatchet {
+  private chainKey: ChainKey;
+  private messageKeys: Map<number, MessageKeys> = new Map();
+
+  constructor(chainKey: ChainKey) {
+    this.chainKey = chainKey;
+  }
+
+  /**
+   * Get the current chain key
+   */
+  getChainKey(): ChainKey {
+    return this.chainKey;
+  }
+
+  /**
+   * Derives a message key for the given counter
+   */
+  async getMessageKey(counter: number): Promise<MessageKeys> {
+    if (counter < this.chainKey.index) {
+      // Try to find it in the saved message keys
+      const messageKey = this.messageKeys.get(counter);
+      if (messageKey) {
+        this.messageKeys.delete(counter);
+        return messageKey;
+      } else {
+        throw new Error(`Message key with counter ${counter} not found`);
+      }
+    }
+
+    // If requesting a future key, advance the chain
+    let key = this.chainKey;
+    while (key.index < counter) {
+      // Save message keys for skipped messages
+      const messageKey = await key.messageKey();
+      this.messageKeys.set(key.index, messageKey);
+
+      // Move to next key
+      key = await key.next();
+    }
+
+    // Update chain key
+    this.chainKey = await key.next();
+
+    // Return the requested message key
+    return await key.messageKey();
+  }
+}
+
+```
+
+```protocol\triple-ratchet.ts
+/**
+ * Triple Ratchet implementation
+ * Extends the Double Ratchet with an additional mini-ratchet for stronger security
+ */
+import { CryptoUtils } from "../crypto/crypto-utils";
+import { BufferUtils } from "../utils/buffer";
+import { Identity } from "./identity";
+import { SymmetricRatchet } from "./symmetric-ratchet";
+import { ChainKey } from "./chain-key";
+import { getCrypto } from "../utils/environment";
+import {
+  ECDHPublicKey,
+  ECDHPrivateKey,
+  ECKeyPair,
+  HMACKey,
+  MessageHeader,
+  MessageKeys,
+  MessageType,
+  PreKeyBundle,
+  RatchetMessage,
+  ECDSAPublicKey,
+} from "../types";
+import { INFO_RATCHET, MAX_SKIP } from "../constants";
+
+/**
+ * The Triple Ratchet implementation
+ * Extends the Double Ratchet with an additional mini-ratchet for stronger security
+ */
+export class TripleRatchet {
+  private identity: Identity;
+  private remoteIdentityKey: ECDHPublicKey;
+  private remoteSigningKey: ECDSAPublicKey;
+
+  // Ratchet state
+  private rootKey: HMACKey;
+  private sendingChain: SymmetricRatchet | null = null;
+  private receivingChain: SymmetricRatchet | null = null;
+  private ourRatchetKey: ECKeyPair;
+  private theirRatchetKey: ECDHPublicKey | null = null;
+
+  // Triple Ratchet enhanced key - the modified secret exponent
+  private enhancedPrivateKey: ECDHPrivateKey;
+
+  // Counters
+  private sendingCounter = 0;
+  private receivingCounter = 0;
+  private previousSendingCounter = 0;
+
+  // Key storage for out-of-order messages
+  private skippedMessageKeys: Map<string, MessageKeys> = new Map();
+
+  private constructor(
+    identity: Identity,
+    remoteIdentityKey: ECDHPublicKey,
+    remoteSigningKey: ECDSAPublicKey,
+    rootKey: HMACKey,
+    ourRatchetKey: ECKeyPair,
+    enhancedPrivateKey: ECDHPrivateKey,
+    theirRatchetKey: ECDHPublicKey | null = null
+  ) {
+    this.identity = identity;
+    this.remoteIdentityKey = remoteIdentityKey;
+    this.remoteSigningKey = remoteSigningKey;
+    this.rootKey = rootKey;
+    this.ourRatchetKey = ourRatchetKey;
+    this.enhancedPrivateKey = enhancedPrivateKey;
+    this.theirRatchetKey = theirRatchetKey;
+  }
+
+  /**
+   * Initializes a Triple Ratchet session from a PreKeyBundle (for initiator)
+   */
+  static async initFromPreKeyBundle(
+    identity: Identity,
+    preKeyBundle: PreKeyBundle
+  ): Promise<TripleRatchet> {
+    // Verify the signed prekey
+    const serializedKey = await CryptoUtils.serializePublicKey(
+      preKeyBundle.signedPreKey
+    );
+    const keyBytes = BufferUtils.fromHex(serializedKey.x + serializedKey.y);
+
+    const isValid = await CryptoUtils.verify(
+      preKeyBundle.signingKey,
+      preKeyBundle.signedPreKeySignature,
+      keyBytes
+    );
+
+    if (!isValid) {
+      throw new Error("Invalid signature for signed prekey");
+    }
+
+    // Generate our ephemeral key
+    const ephemeralKey = await CryptoUtils.generateECDHKeyPair();
+
+    // Calculate shared secrets (X3DH)
+    const dh1 = await CryptoUtils.computeDH(
+      identity.dhKeyPair.privateKey,
+      preKeyBundle.signedPreKey
+    );
+
+    const dh2 = await CryptoUtils.computeDH(
+      ephemeralKey.privateKey,
+      preKeyBundle.identityKey
+    );
+
+    const dh3 = await CryptoUtils.computeDH(
+      ephemeralKey.privateKey,
+      preKeyBundle.signedPreKey
+    );
+
+    const dh4 = await CryptoUtils.computeDH(
+      ephemeralKey.privateKey,
+      preKeyBundle.preKey
+    );
+
+    // Combine DH outputs to create the master secret
+    const masterSecret = BufferUtils.concat(dh1, dh2, dh3, dh4);
+
+    // Derive initial root key
+    const keys = await CryptoUtils.hkdf(masterSecret, null, INFO_RATCHET, 1);
+
+    const rootKey = await CryptoUtils.importHmacKey(keys[0]);
+
+    // Create our first ratchet key pair
+    const ourRatchetKey = await CryptoUtils.generateECDHKeyPair();
+
+    // For Triple Ratchet, we need to initialize with the enhanced private key
+    // which is the same as the regular private key for the initiator since there's no shared secret yet
+    const enhancedPrivateKey = ourRatchetKey.privateKey;
+
+    return new TripleRatchet(
+      identity,
+      preKeyBundle.identityKey,
+      preKeyBundle.signingKey,
+      rootKey,
+      ourRatchetKey,
+      enhancedPrivateKey,
+      null
+    );
+  }
+
+  /**
+   * Initializes a Triple Ratchet session from a PreKey message (for receiver)
+   */
+  static async initFromPreKeyMessage(
+    identity: Identity,
+    preKeyMessage: RatchetMessage,
+    preKeyId: number,
+    signedPreKeyId: number
+  ): Promise<TripleRatchet> {
+    if (
+      preKeyMessage.type !== MessageType.PRE_KEY ||
+      !preKeyMessage.identityKey ||
+      preKeyMessage.preKeyId === undefined ||
+      preKeyMessage.signedPreKeyId === undefined
+    ) {
+      throw new Error("Invalid PreKey message");
+    }
+
+    // Retrieve our keys
+    const signedPreKey = identity.signedPreKeys.get(signedPreKeyId);
+    const preKey = identity.preKeys.get(preKeyId);
+
+    if (!signedPreKey || !preKey) {
+      throw new Error("PreKey or SignedPreKey not found");
+    }
+
+    // Calculate shared secrets (X3DH)
+    const dh1 = await CryptoUtils.computeDH(
+      signedPreKey.privateKey,
+      preKeyMessage.identityKey
+    );
+
+    const dh2 = await CryptoUtils.computeDH(
+      identity.dhKeyPair.privateKey,
+      preKeyMessage.header.publicKey
+    );
+
+    const dh3 = await CryptoUtils.computeDH(
+      signedPreKey.privateKey,
+      preKeyMessage.header.publicKey
+    );
+
+    const dh4 = await CryptoUtils.computeDH(
+      preKey.privateKey,
+      preKeyMessage.header.publicKey
+    );
+
+    // Combine DH outputs to create the master secret
+    const masterSecret = BufferUtils.concat(dh1, dh2, dh3, dh4);
+
+    // Derive initial root key
+    const keys = await CryptoUtils.hkdf(masterSecret, null, INFO_RATCHET, 1);
+
+    const rootKey = await CryptoUtils.importHmacKey(keys[0]);
+
+    // Create our first ratchet key
+    const ourRatchetKey = await CryptoUtils.generateECDHKeyPair();
+
+    // Initialize with their ratchet key
+    const theirRatchetKey = preKeyMessage.header.publicKey;
+
+    // For Triple Ratchet, initialize the enhanced private key
+    // For the receiver, it starts the same as the regular private key
+    const enhancedPrivateKey = ourRatchetKey.privateKey;
+
+    const ratchet = new TripleRatchet(
+      identity,
+      preKeyMessage.identityKey,
+      preKeyMessage.identityKey, // In this initial message, we use identity key for signing too
+      rootKey,
+      ourRatchetKey,
+      enhancedPrivateKey,
+      theirRatchetKey
+    );
+
+    // Initialize the receiving chain
+    await ratchet.createReceivingChain(preKeyMessage.header);
+
+    return ratchet;
+  }
+
+  /**
+   * Encrypt a message using the Triple Ratchet
+   */
+  async encrypt(plaintext: ArrayBuffer): Promise<RatchetMessage> {
+    // Create sending chain if needed
+    if (!this.sendingChain) {
+      await this.createSendingChain();
+    }
+
+    // Get message key from the chain
+    const messageKeys = await this.sendingChain!.getMessageKey(
+      this.sendingCounter
+    );
+
+    // Encrypt the message
+    const ciphertext = await CryptoUtils.encrypt(
+      messageKeys.encKey,
+      plaintext,
+      messageKeys.iv
+    );
+
+    // Prepare the message header
+    const header: MessageHeader = {
+      publicKey: this.ourRatchetKey.publicKey,
+      previousCounter: this.previousSendingCounter,
+      messageCounter: this.sendingCounter++,
+    };
+
+    // Determine if this is the first message (PreKey message)
+    const isInitialMessage =
+      !this.theirRatchetKey &&
+      this.sendingCounter === 1 &&
+      this.previousSendingCounter === 0;
+
+    const message: RatchetMessage = {
+      type: isInitialMessage ? MessageType.PRE_KEY : MessageType.NORMAL,
+      header,
+      ciphertext,
+    };
+
+    // If it's a PreKey message, include additional data
+    if (isInitialMessage) {
+      message.identityKey = this.identity.dhKeyPair.publicKey;
+      message.preKeyId = 0; // Placeholder, would be determined by protocol
+      message.signedPreKeyId = 0; // Placeholder, would be determined by protocol
+    }
+
+    return message;
+  }
+
+  /**
+   * Decrypt a message using the Triple Ratchet
+   */
+  async decrypt(message: RatchetMessage): Promise<ArrayBuffer> {
+    // Check if we have a saved key for this message
+    const headerKey = this.getHeaderKey(message.header);
+    const cachedKeys = this.skippedMessageKeys.get(headerKey);
+
+    if (cachedKeys) {
+      this.skippedMessageKeys.delete(headerKey);
+      return CryptoUtils.decrypt(
+        cachedKeys.encKey,
+        message.ciphertext,
+        cachedKeys.iv
+      );
+    }
+
+    // Handle ratchet update if the message is from a new ratchet key
+    if (
+      !this.theirRatchetKey ||
+      !(await this.isEqualPublicKeys(
+        this.theirRatchetKey,
+        message.header.publicKey
+      ))
+    ) {
+      await this.handleRatchetUpdate(message.header);
+    }
+
+    // Skip ahead to the correct message key if needed
+    const messageKeys = await this.receivingChain!.getMessageKey(
+      message.header.messageCounter
+    );
+
+    // Decrypt the message
+    return CryptoUtils.decrypt(
+      messageKeys.encKey,
+      message.ciphertext,
+      messageKeys.iv
+    );
+  }
+
+  /**
+   * Handles a ratchet update when receiving a message with a new ratchet key
+   */
+  private async handleRatchetUpdate(header: MessageHeader): Promise<void> {
+    // Save current chain keys for skipped messages
+    await this.saveSkippedMessageKeys(header);
+
+    // Update the remote ratchet key
+    this.theirRatchetKey = header.publicKey;
+    this.previousSendingCounter = this.sendingCounter;
+    this.sendingCounter = 0;
+    this.receivingCounter = 0;
+
+    // Create new receiving chain
+    await this.createReceivingChain(header);
+
+    // Generate new ratchet key pair for the next sending chain
+    this.ourRatchetKey = await CryptoUtils.generateECDHKeyPair();
+
+    // Triple Ratchet enhancement:
+    // Modify our private key after receiving a new ratchet key
+    await this.updateEnhancedPrivateKey();
+
+    // Clear the sending chain since it will be recreated when needed
+    this.sendingChain = null;
+  }
+
+  /**
+   * Implements the Triple Ratchet enhancement by updating the private key
+   * with a deterministic modification based on the shared secret
+   */
+  private async updateEnhancedPrivateKey(): Promise<void> {
+    if (!this.theirRatchetKey) {
+      throw new Error(
+        "Cannot update enhanced private key without theirRatchetKey"
+      );
+    }
+
+    // Calculate the shared secret (I_t in the Triple Ratchet paper)
+    const sharedSecret = await CryptoUtils.computeDH(
+      this.ourRatchetKey.privateKey,
+      this.theirRatchetKey
+    );
+
+    // Hash the shared secret - H(I_t) in the Triple Ratchet paper
+    const hashedSecret = await CryptoUtils.hash(sharedSecret);
+
+    // In a real implementation, we would compute x_t' = x_t · H(I_t) mod q
+    // where q is the order of the curve
+    // Since we can't directly operate on the private key material in Web Crypto,
+    // we would need a custom implementation of the ECDH key operations
+
+    // For this example, we'll just note that this is where we would update
+    // the enhanced private key for the Triple Ratchet protocol
+    // this.enhancedPrivateKey = modifiedKey;
+
+    // Instead, we'll just use the original key for demonstration purposes
+    this.enhancedPrivateKey = this.ourRatchetKey.privateKey;
+  }
+
+  /**
+   * Creates a new sending chain
+   */
+  private async createSendingChain(): Promise<void> {
+    if (!this.theirRatchetKey) {
+      throw new Error("Cannot create sending chain without remote ratchet key");
+    }
+
+    // Triple Ratchet: Use the enhanced private key for DH
+    const dhResult = await CryptoUtils.computeDH(
+      this.enhancedPrivateKey,
+      this.theirRatchetKey
+    );
+
+    // Derive new root key and chain key
+    const crypto = getCrypto();
+    const rootKeyRaw = await crypto.subtle.exportKey("raw", this.rootKey);
+
+    const keys = await CryptoUtils.hkdf(dhResult, rootKeyRaw, INFO_RATCHET, 2);
+
+    // Update root key
+    this.rootKey = await CryptoUtils.importHmacKey(keys[0]);
+
+    // Create sending chain
+    const chainKey = await CryptoUtils.importHmacKey(keys[1]);
+    this.sendingChain = new SymmetricRatchet(new ChainKey(chainKey, 0));
+  }
+
+  /**
+   * Creates a new receiving chain
+   */
+  private async createReceivingChain(header: MessageHeader): Promise<void> {
+    // Triple Ratchet: Use the enhanced private key for DH
+    const dhResult = await CryptoUtils.computeDH(
+      this.enhancedPrivateKey,
+      header.publicKey
+    );
+
+    // Derive new root key and chain key
+    const crypto = getCrypto();
+    const rootKeyRaw = await crypto.subtle.exportKey("raw", this.rootKey);
+
+    const keys = await CryptoUtils.hkdf(dhResult, rootKeyRaw, INFO_RATCHET, 2);
+
+    // Update root key
+    this.rootKey = await CryptoUtils.importHmacKey(keys[0]);
+
+    // Create receiving chain
+    const chainKey = await CryptoUtils.importHmacKey(keys[1]);
+    this.receivingChain = new SymmetricRatchet(new ChainKey(chainKey, 0));
+  }
+
+  /**
+   * Saves message keys that might be skipped
+   */
+  private async saveSkippedMessageKeys(header: MessageHeader): Promise<void> {
+    if (this.receivingChain) {
+      const currentIndex = this.receivingChain.getChainKey().index;
+      const messageCount = Math.min(header.previousCounter, MAX_SKIP);
+
+      for (let i = currentIndex; i < messageCount; i++) {
+        const messageKeys = await this.receivingChain.getMessageKey(i);
+        const headerKey = this.getHeaderKey({
+          publicKey: this.theirRatchetKey!,
+          previousCounter: 0, // Not used for lookup
+          messageCounter: i,
+        });
+
+        this.skippedMessageKeys.set(headerKey, messageKeys);
+      }
+    }
+  }
+
+  /**
+   * Creates a lookup key for message headers
+   */
+  private getHeaderKey(header: MessageHeader): string {
+    return `${header.messageCounter}:${header.publicKey}`;
+  }
+
+  /**
+   * Compares two public keys for equality
+   */
+  private async isEqualPublicKeys(
+    a: ECDHPublicKey,
+    b: ECDHPublicKey
+  ): Promise<boolean> {
+    const aSerialized = await CryptoUtils.serializePublicKey(a);
+    const bSerialized = await CryptoUtils.serializePublicKey(b);
+    return aSerialized.x === bSerialized.x && aSerialized.y === bSerialized.y;
+  }
+}
+
+```
+
+```types\index.ts
+/**
+ * Triple Ratchet - Core type definitions
+ */
+
+// Cryptographic key types
+export type ECDHPublicKey = CryptoKey;
+export type ECDHPrivateKey = CryptoKey;
+export type ECDSAPublicKey = CryptoKey;
+export type ECDSAPrivateKey = CryptoKey;
+export type HMACKey = CryptoKey;
+export type AESKey = CryptoKey;
+
+// Key pair types
+export interface ECKeyPair {
+  publicKey: ECDHPublicKey;
+  privateKey: ECDHPrivateKey;
+}
+
+export interface SigningKeyPair {
+  publicKey: ECDSAPublicKey;
+  privateKey: ECDSAPrivateKey;
+}
+
+// Serialized EC public key format
+export interface SerializedECPublicKey {
+  x: string;
+  y: string;
+}
+
+// Message types for the Triple Ratchet protocol
+export enum MessageType {
+  NORMAL = 0,
+  PRE_KEY = 1,
+}
+
+// A message header contains metadata for a ratchet message
+export interface MessageHeader {
+  publicKey: ECDHPublicKey; // Sender's ratchet public key
+  previousCounter: number; // Number of messages in previous sending chain
+  messageCounter: number; // Message number in current chain
+}
+
+// A ratchet message contains the encrypted data and metadata
+export interface RatchetMessage {
+  type: MessageType;
+  header: MessageHeader;
+  ciphertext: ArrayBuffer;
+  // For PreKeyMessages only
+  identityKey?: ECDHPublicKey;
+  preKeyId?: number;
+  signedPreKeyId?: number;
+}
+
+// The message keys used for encryption/decryption
+export interface MessageKeys {
+  encKey: AESKey;
+  authKey: HMACKey;
+  iv: ArrayBuffer;
+}
+
+// A PreKeyBundle is used to establish initial communication
+export interface PreKeyBundle {
+  identityId: number;
+  identityKey: ECDHPublicKey;
+  signedPreKeyId: number;
+  signedPreKey: ECDHPublicKey;
+  signedPreKeySignature: ArrayBuffer;
+  preKeyId: number;
+  preKey: ECDHPublicKey;
+  signingKey: ECDSAPublicKey;
+}
+
+```
+
+```utils\buffer.ts
+/**
+ * Buffer utilities for the Triple Ratchet
+ */
+export class BufferUtils {
+  /**
+   * Concatenates multiple ArrayBuffers
+   */
+  static concat(...buffers: ArrayBuffer[]): ArrayBuffer {
+    const totalLength = buffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+
+    for (const buffer of buffers) {
+      result.set(new Uint8Array(buffer), offset);
+      offset += buffer.byteLength;
+    }
+
+    return result.buffer;
+  }
+
+  /**
+   * Compares two ArrayBuffers for equality
+   */
+  static equal(a: ArrayBuffer, b: ArrayBuffer): boolean {
+    if (a.byteLength !== b.byteLength) return false;
+
+    const viewA = new Uint8Array(a);
+    const viewB = new Uint8Array(b);
+
+    for (let i = 0; i < viewA.length; i++) {
+      if (viewA[i] !== viewB[i]) return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Converts an ArrayBuffer to a hex string
+   */
+  static toHex(buffer: ArrayBuffer): string {
+    return Array.from(new Uint8Array(buffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /**
+   * Converts a hex string to an ArrayBuffer
+   */
+  static fromHex(hex: string): ArrayBuffer {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+    }
+    return bytes.buffer;
+  }
+}
+
+```
+
+```utils\environment.ts
+/**
+ * Environment detection utilities
+ */
+
+export const isBrowser =
+  typeof window !== "undefined" && typeof window.crypto !== "undefined";
+
+export function getCrypto(): Crypto {
+  if (isBrowser) {
+    return window.crypto;
+  }
+  throw new Error("Web Crypto API is not available in this environment");
+}
+
+```

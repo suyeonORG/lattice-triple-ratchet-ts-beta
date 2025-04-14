@@ -1,0 +1,190 @@
+<!-- /test-runner.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Triple Ratchet Protocol Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+        }
+
+        h2 {
+            color: #3498db;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }
+
+        #console {
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', Courier, monospace;
+            height: 500px;
+            overflow-y: auto;
+        }
+
+        .success {
+            color: #2ecc71;
+        }
+
+        .error {
+            color: #e74c3c;
+        }
+
+        .info {
+            color: #3498db;
+        }
+
+        .warning {
+            color: #f39c12;
+        }
+
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+
+        button:hover {
+            background-color: #2980b9;
+        }
+
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Triple Ratchet Protocol Test</h1>
+
+        <p>This page demonstrates the Triple Ratchet secure messaging protocol implementation. Click the button below to
+            run the test suite that demonstrates:</p>
+
+        <ul>
+            <li>Initial key exchange and session setup</li>
+            <li>Secure message exchange in both directions</li>
+            <li>Key rotation for forward secrecy</li>
+            <li>Out-of-order message handling</li>
+        </ul>
+
+        <button id="runTestBtn">Run Test Suite</button>
+
+        <h2>Console Output</h2>
+        <div id="console"></div>
+    </div>
+
+    <script type="module">
+        // Import your test class here
+        import { TripleRatchetTest } from './dist/test/triple-ratchet-test.js';
+
+        const consoleEl = document.getElementById('console');
+        const runTestBtn = document.getElementById('runTestBtn');
+
+        // Override console methods to display in our custom console
+        const originalConsole = {
+            log: console.log,
+            error: console.error,
+            warn: console.warn,
+            info: console.info
+        };
+
+        console.log = function (...args) {
+            originalConsole.log(...args);
+            const message = args.map(arg =>
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
+            ).join(' ');
+            appendToConsole(message);
+        };
+
+        console.error = function (...args) {
+            originalConsole.error(...args);
+            const message = args.map(arg =>
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
+            ).join(' ');
+            appendToConsole(message, 'error');
+        };
+
+        console.warn = function (...args) {
+            originalConsole.warn(...args);
+            const message = args.map(arg =>
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
+            ).join(' ');
+            appendToConsole(message, 'warning');
+        };
+
+        console.info = function (...args) {
+            originalConsole.info(...args);
+            const message = args.map(arg =>
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
+            ).join(' ');
+            appendToConsole(message, 'info');
+        };
+
+        function appendToConsole(message, type = '') {
+            const lineEl = document.createElement('div');
+            lineEl.textContent = message;
+            if (type) {
+                lineEl.classList.add(type);
+            }
+            consoleEl.appendChild(lineEl);
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+
+        // Run the test when the button is clicked
+        runTestBtn.addEventListener('click', async () => {
+            consoleEl.innerHTML = '';
+            runTestBtn.disabled = true;
+            runTestBtn.textContent = 'Running Test...';
+
+            try {
+                appendToConsole('Starting Triple Ratchet Test Suite...', 'info');
+                const test = new TripleRatchetTest();
+                await test.runTest();
+                runTestBtn.textContent = 'Test Completed';
+            } catch (error) {
+                console.error('Test failed:', error);
+                runTestBtn.textContent = 'Test Failed';
+            } finally {
+                setTimeout(() => {
+                    runTestBtn.disabled = false;
+                    runTestBtn.textContent = 'Run Test Suite';
+                }, 3000);
+            }
+        });
+    </script>
+</body>
+
+</html>
