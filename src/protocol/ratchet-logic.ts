@@ -111,7 +111,7 @@ async function deriveMessageKeysFromChainKey(
 
   // Use HMAC-SHA256 with the chain key to derive the input for HKDF
   const derivedCombinedKeyMaterial = await crypto.subtle.sign(
-    HMAC_ALGORITHM.name,
+    HMAC_ALGORITHM,
     chainKey,
     messageKeyInput
   );
@@ -125,9 +125,23 @@ async function deriveMessageKeysFromChainKey(
     3, // Derive 3 keys: AES key, Auth key, IV base
     32 // Each key material is 32 bytes
   );
+  const rawEnc = new Uint8Array(keys[0]);
+  const rawAuth = new Uint8Array(keys[1]);
+  const rawIvMat = new Uint8Array(keys[2]);
+  console.log("🔑 [HKDF] rawEncKey: ", bytesToHex(rawEnc));
+  console.log("🔑 [HKDF] rawAuthKey:", bytesToHex(rawAuth));
+  console.log(
+    "🔑 [HKDF] rawIvMat (first 12 bytes):",
+    bytesToHex(rawIvMat.slice(0, 12))
+  );
 
-  const iv = keys[2].slice(0, 12); // Use first 12 bytes of the third derived key as IV
-
+  const iv = rawIvMat.subarray(0, 12); // always a Uint8Array // Use first 12 bytes of the third derived key as IV
+  console.log("🔑 [Encrypt] rawEncKey:", bytesToHex(new Uint8Array(keys[0])));
+  console.log("🔑 [Encrypt] rawAuthKey:", bytesToHex(new Uint8Array(keys[1])));
+  console.log(
+    "🔑 [Encrypt] rawIv:",
+    bytesToHex(new Uint8Array(keys[2]).slice(0, 12))
+  );
   return {
     encKey: await importAesKey(keys[0]), // Import raw bytes as AES key
     authKey: await importHmacKey(keys[1]), // Import raw bytes as HMAC key
@@ -147,7 +161,7 @@ async function advanceChainKey(chainKey: HMACKey): Promise<HMACKey> {
 
   // Use HMAC-SHA256 with the current chain key to derive the next chain key material
   const nextKeyMaterial = await crypto.subtle.sign(
-    HMAC_ALGORITHM.name,
+    HMAC_ALGORITHM,
     chainKey,
     nextKeyInput
   );
@@ -175,7 +189,7 @@ export async function getSymRatchetMessageKey(
   if (newSkippedKeys.has(counter)) {
     const messageKeys = newSkippedKeys.get(counter)!;
     newSkippedKeys.delete(counter); // Consume the skipped key
-    console.debug(
+    console.log(
       `Used skipped message key for index ${counter}. Remaining skipped: ${newSkippedKeys.size}`
     );
     return {
@@ -200,7 +214,7 @@ export async function getSymRatchetMessageKey(
 
   // Advance the chain until the desired counter is reached
   while (currentIndex < counter) {
-    console.debug(`Skipping message key for index ${currentIndex}`);
+    console.log(`Skipping message key for index ${currentIndex}`);
     const messageKeys = await deriveMessageKeysFromChainKey(currentChainKey);
     newSkippedKeys.set(currentIndex, messageKeys); // Store the skipped key
     currentChainKey = await advanceChainKey(currentChainKey); // Advance the chain key
@@ -296,7 +310,7 @@ function calculateEnhancedPrivateKey(
   // Use helper function as p256.utils.scalarToBytes was causing issues
   const enhancedPrivateKeyBytes = bigIntTo32Bytes(enhancedScalar);
 
-  console.debug("Triple Ratchet: Enhanced private key calculated.");
+  console.log("Triple Ratchet: Enhanced private key calculated.");
   return enhancedPrivateKeyBytes;
 }
 
@@ -326,7 +340,7 @@ export async function initializeRatchetInitiator(
 
   // 2. Generate our ephemeral key pair for this session (EKa)
   const ephemeralKeyPair = generateECDHKeyPair();
-  console.log("Generated ephemeral key pair for initiator.");
+  console.log("Generated ephemeral key pair for X3DH & initial ratchet.");
 
   // 3. Perform X3DH calculations (Alice's perspective)
   // DH1: Alice's Identity Private Key (IKa) <-> Bob's Signed PreKey Public Key (SPKb)
@@ -358,13 +372,12 @@ export async function initializeRatchetInitiator(
   const initialRootKey = await importHmacKey(initialKeys[0]);
   console.log("Derived initial root key.");
 
-  // 6. Generate our first ratchet key pair (RKa_0)
-  const initialRatchetKeyPair = generateECDHKeyPair();
+  // 6. Use the X3DH ephemeral as our initial ratchet key (RKa_0)
+  const initialRatchetKeyPair = ephemeralKeyPair;
   console.log("Generated initial sending ratchet key pair.");
 
-  // 7. Initial "enhanced" private key is just the normal private key (x'_0 = x_0)
-  // The enhancement happens *after* the first DH calculation using this key.
-  const initialEnhancedPrivateKey = initialRatchetKeyPair.privateKey;
+  // 7. Initial "enhanced" private key is just x_0' = x_0 (no mini‑ratchet yet)
+  const initialEnhancedPrivateKey = ephemeralKeyPair.privateKey;
 
   // 8. Initial State Setup for Alice (Initiator)
   const initialState: RatchetState = {
@@ -373,7 +386,7 @@ export async function initializeRatchetInitiator(
     remoteIdentityKey: preKeyBundle.identityKey, // Bob's Identity Key
     remoteSigningKey: preKeyBundle.signingKey, // Bob's Signing Key
     rootKey: initialRootKey,
-    ourRatchetKeyPair: initialRatchetKeyPair, // Alice's first ratchet key (RKa_0)
+    ourRatchetKeyPair: initialRatchetKeyPair, // Alice's first ratchet key (EKa)
     theirRatchetKey: preKeyBundle.signedPreKey, // Alice assumes Bob's first key is SPKb initially ??? Should this be null until first message? X3DH implies SPKb is used in initial calculation, but Bob's first *ratchet* key RKb_0 is unknown. Let's set to null.
     // theirRatchetKey: null, // Bob's ratchet key is unknown until his first message
     ourEnhancedPrivateKey: initialEnhancedPrivateKey, // x'_0
@@ -479,7 +492,7 @@ export async function initializeRatchetReceiver(
   const initialTheirRatchetKey = preKeyMessage.header.publicKey;
 
   // 7. Generate our first ratchet key pair (RKb_0)
-  const initialRatchetKeyPair = generateECDHKeyPair();
+  const initialRatchetKeyPair = ownSignedPreKeyPair;
   console.log("Generated initial receiving ratchet key pair.");
 
   // 8. Initial "enhanced" private key is just the normal private key (y'_0 = y_0)
@@ -528,29 +541,32 @@ export async function ratchetEncrypt(
   let sendingChain = nextState.sendingChain;
   let currentRatchetKeyPair = nextState.ourRatchetKeyPair; // Key pair used for DH/header
 
-  // --- DH Ratchet Step (if sendingChain is null, means we need a new one) ---
+  // Prepare holders for the “next” ratchet key & enhanced private key
+  let nextRatchetKeyPair: ECKeyPair | null = null;
+  let nextEnhancedPrivateKey: ECDHPrivateKey | null = null;
+
+  // --- DH Ratchet Step (if sendingChain is null) ---
   if (!sendingChain) {
     console.log("Performing DH ratchet step before sending.");
     if (!nextState.theirRatchetKey) {
-      // This should not happen after initialization
       throw new Error("Cannot encrypt: Remote ratchet key not established.");
     }
 
-    // DH calculation using the *current* enhanced private key (x'_t or y'_t) and their public key
+    // 1) compute DH output using the *old* enhanced private key
     const dhOutput = computeDH(
-      nextState.ourEnhancedPrivateKey, // Use the enhanced key x'_t
-      nextState.theirRatchetKey // Their Rk pub (RK_other)
+      nextState.ourEnhancedPrivateKey,
+      nextState.theirRatchetKey
     );
     console.log("Calculated DH output for new chain.");
 
-    // Derive new root key and sending chain key
+    // 2) derive new root & chain keys
     const { newRootKey, newChainKey } = await performDHRatchetStep(
       nextState.rootKey,
       dhOutput
     );
     console.log("Derived new root key and sending chain key.");
 
-    // Initialize the new sending chain
+    // 3) initialize the new sending chain
     sendingChain = {
       chainKey: newChainKey,
       chainIndex: 0,
@@ -558,91 +574,83 @@ export async function ratchetEncrypt(
     };
     nextState.rootKey = newRootKey;
     nextState.sendingChain = sendingChain;
-    nextState.sendMsgCounter = 0; // Reset message counter for the new chain
-    nextState.prevSendMsgCounter = currentState.sendMsgCounter; // Store previous chain's count
+    nextState.sendMsgCounter = 0;
+    nextState.prevSendMsgCounter = currentState.sendMsgCounter;
 
-    // --- Triple Ratchet Enhancement (Sender Side) ---
-    // Generate the *next* ratchet key pair (RK_our, t+1)
-    const nextRatchetKeyPair = generateECDHKeyPair();
+    // 4) generate *next* ratchet key pair but do NOT apply it yet
+    nextRatchetKeyPair = generateECDHKeyPair();
     console.log("Generated next ratchet key pair.");
 
-    // Calculate the *next* enhanced private key (x'_{t+1} or y'_{t+1})
-    // This uses the *newly generated* private key (x_{t+1}) and the *just calculated* DH output (I_t)
-    const nextEnhancedPrivateKey = calculateEnhancedPrivateKey(
-      nextRatchetKeyPair.privateKey, // x_{t+1}
-      dhOutput // I_t
+    // 5) calculate the *next* enhanced private key
+    nextEnhancedPrivateKey = calculateEnhancedPrivateKey(
+      nextRatchetKeyPair.privateKey,
+      dhOutput
     );
     console.log("Calculated next enhanced private key.");
 
-    // Update state with the *new* key pair and *new* enhanced key for the *next* DH step
-    nextState.ourRatchetKeyPair = nextRatchetKeyPair; // Store RK_our, t+1
-    nextState.ourEnhancedPrivateKey = nextEnhancedPrivateKey; // Store x'_{t+1}
-    currentRatchetKeyPair = currentState.ourRatchetKeyPair; // The message header uses the *old* public key RK_our, t
-  } // End DH Ratchet Step
+    // 6) ensure the header for this message still uses the old pair
+    currentRatchetKeyPair = currentState.ourRatchetKeyPair;
+  }
 
   // --- Symmetric Ratchet Step ---
   if (!sendingChain) {
-    // Should be impossible if DH step logic is correct
     throw new Error(
       "Internal error: Sending chain not available after DH check."
     );
   }
 
-  const currentSendCounter = nextState.sendMsgCounter; // Counter for this message (N)
+  const currentSendCounter = nextState.sendMsgCounter;
   console.log(`Encrypting message ${currentSendCounter} in current chain.`);
   const { messageKeys, nextChainState: updatedSendingChain } =
     await getSymRatchetMessageKey(sendingChain, currentSendCounter);
-  nextState.sendingChain = updatedSendingChain; // Update chain state (key advanced, index incremented)
-  nextState.sendMsgCounter = currentSendCounter + 1; // Increment message counter for next time
+  nextState.sendingChain = updatedSendingChain;
+  nextState.sendMsgCounter = currentSendCounter + 1;
 
-  // --- AES Encryption ---
-  const headerPublicKey = currentRatchetKeyPair.publicKey; // Public key corresponding to the private key used for DH (RK_our, t pub)
-  // Construct Associated Data (AD) - must be the same for encryption and decryption
+  // --- AES‐GCM Encryption ---
+  const headerPublicKey = currentRatchetKeyPair.publicKey;
   const adObject = {
-    pk: bytesToHex(headerPublicKey), // Include sender's public key used for DH
-    pn: nextState.prevSendMsgCounter, // Previous chain message count
-    n: currentSendCounter, // Current chain message count
+    pk: bytesToHex(headerPublicKey),
+    pn: nextState.prevSendMsgCounter,
+    n: currentSendCounter,
   };
-  const aadBuffer = stringToBytes(JSON.stringify(adObject)); // Serialize AD to bytes
+  const aadBuffer = stringToBytes(JSON.stringify(adObject));
 
   console.log("Encrypting plaintext with AES-GCM.");
+  const rawEncKey = new Uint8Array(await exportRawKey(messageKeys.encKey));
+  console.log("🔑 [Encrypt] encKey:", bytesToHex(rawEncKey));
+  console.log("🔑 [Encrypt] iv:", bytesToHex(new Uint8Array(messageKeys.iv)));
+  console.log("🔑 [Encrypt] aad:", new TextDecoder().decode(aadBuffer));
   const ciphertext = await encryptAES(
-    messageKeys.encKey, // AES key from symmetric ratchet
+    messageKeys.encKey,
     plaintext,
-    messageKeys.iv, // IV from symmetric ratchet
-    aadBuffer // Authenticated Data
+    messageKeys.iv,
+    aadBuffer
   );
 
-  // --- Construct Message ---
+  // --- Construct RatchetMessage ---
   const header: MessageHeader = {
-    publicKey: headerPublicKey, // RK_our, t pub
-    previousCounter: nextState.prevSendMsgCounter, // PN
-    messageCounter: currentSendCounter, // N
+    publicKey: headerPublicKey,
+    previousCounter: nextState.prevSendMsgCounter,
+    messageCounter: currentSendCounter,
   };
 
-  // Determine if this is the very first message (PreKey type)
   const isInitialMessage =
     currentState.sendMsgCounter === 0 &&
     currentState.prevSendMsgCounter === 0 &&
-    !currentState.receivingChain && // Check if we haven't received anything yet
-    currentState.theirRatchetKey !== null; // Ensure we have a key to send to
+    !currentState.receivingChain &&
+    currentState.theirRatchetKey !== null;
 
   const message: RatchetMessage = {
-    // Use MessageType enum value
     type: isInitialMessage ? MessageType.PRE_KEY : MessageType.NORMAL,
     header,
     ciphertext,
   };
 
-  // Add extra fields for PreKey messages
   if (message.type === MessageType.PRE_KEY) {
     console.log("Creating PreKey message.");
-    message.identityKey = nextState.identityPublicKey; // Our IKa pub
-    // These IDs need to correspond to the keys Bob actually used from the bundle
-    // This requires the initiator state to remember which keys were used.
-    // For now, using placeholders. This needs proper handling based on PreKeyBundle.
-    message.preKeyId = 0; // Placeholder - should be bundle.preKeyId
-    message.signedPreKeyId = 0; // Placeholder - should be bundle.signedPreKeyId
+    message.identityKey = nextState.identityPublicKey;
+    message.preKeyId = 0; // TODO: wire in actual bundle IDs
+    message.signedPreKeyId = 0; // TODO: wire in actual bundle IDs
   }
 
   console.log(
@@ -650,6 +658,13 @@ export async function ratchetEncrypt(
       header.messageCounter
     }, PN: ${header.previousCounter}`
   );
+
+  // --- Now that the message is sent with the OLD header key, advance Alice’s own ratchet key ---
+  if (nextRatchetKeyPair && nextEnhancedPrivateKey) {
+    nextState.ourRatchetKeyPair = nextRatchetKeyPair;
+    nextState.ourEnhancedPrivateKey = nextEnhancedPrivateKey;
+  }
+
   return { message, nextState };
 }
 
@@ -678,7 +693,7 @@ export async function ratchetDecrypt(
   currentState: RatchetState,
   message: RatchetMessage
 ): Promise<{ plaintext: ArrayBuffer; nextState: RatchetState }> {
-  let nextState = { ...currentState }; // Copy state
+  let nextState = { ...currentState };
   let plaintext: ArrayBuffer | null = null;
   const header = message.header;
 
@@ -688,150 +703,60 @@ export async function ratchetDecrypt(
     }, PN: ${header.previousCounter}, PubKey: ${bytesToHex(header.publicKey)}`
   );
 
-  // --- Try Decrypting with Skipped Keys First ---
-  // Check if we have a skipped key corresponding to this message's header info
-  const skippedKeyLookup = getSkippedKeyLookupKey(header);
-  const skippedMessageKeys = nextState.skippedRatchetKeys.get(skippedKeyLookup);
-
-  if (skippedMessageKeys) {
-    console.log(
-      `Found skipped message key for N=${
-        header.messageCounter
-      }, PubKey=${bytesToHex(header.publicKey)}. Attempting decryption.`
+  // 1) Try any skipped message key first
+  const lookup = `${header.messageCounter}:${bytesToHex(header.publicKey)}`;
+  if (nextState.skippedRatchetKeys.has(lookup)) {
+    const skipped = nextState.skippedRatchetKeys.get(lookup)!;
+    nextState.skippedRatchetKeys.delete(lookup);
+    const aad = stringToBytes(
+      JSON.stringify({
+        pk: bytesToHex(header.publicKey),
+        pn: header.previousCounter,
+        n: header.messageCounter,
+      })
     );
-    const adObject = {
-      pk: bytesToHex(header.publicKey),
-      pn: header.previousCounter,
-      n: header.messageCounter,
-    };
-    const aadBuffer = stringToBytes(JSON.stringify(adObject));
-
-    try {
-      plaintext = await decryptAES(
-        skippedMessageKeys.encKey,
-        message.ciphertext,
-        skippedMessageKeys.iv,
-        aadBuffer
-      );
-      console.log("Decryption successful using skipped key.");
-
-      // Remove the used skipped key
-      const updatedSkipped = new Map(nextState.skippedRatchetKeys);
-      updatedSkipped.delete(skippedKeyLookup);
-      nextState.skippedRatchetKeys = updatedSkipped;
-
-      return { plaintext, nextState }; // Return successfully decrypted message and updated state
-    } catch (error) {
-      console.error("Decryption failed using skipped key:", error);
-      // If decryption fails even with a skipped key, something is wrong.
-      // Don't proceed further with this key. Remove it.
-      const updatedSkipped = new Map(nextState.skippedRatchetKeys);
-      updatedSkipped.delete(skippedKeyLookup);
-      nextState.skippedRatchetKeys = updatedSkipped;
-      // Re-throw or handle as a critical error, as the skipped key was invalid.
-      throw new Error(
-        `Decryption failed even with skipped key for N=${header.messageCounter}. Message might be corrupt or state desynchronized.`
-      );
-    }
+    plaintext = await decryptAES(
+      skipped.encKey,
+      message.ciphertext,
+      skipped.iv,
+      aad
+    );
+    console.log("✔️ Decrypted with skipped key");
+    return { plaintext, nextState };
   }
-  console.log("No suitable skipped key found. Proceeding with ratchet steps.");
+  console.log("No skipped key – proceeding");
 
-  // --- Check for DH Ratchet Step ---
+  // 2) Only perform a DH‐ratchet when it’s a PRE_KEY message
   let receivingChain = nextState.receivingChain;
-  let performDH = false;
-
-  // Perform DH if:
-  // 1. We don't have a receiving chain yet (first message after our DH step)
-  // 2. The public key in the message header is different from the one we expected for the current receiving chain
-  if (
-    !receivingChain ||
-    (nextState.theirRatchetKey &&
-      !equalPublicKeys(nextState.theirRatchetKey, header.publicKey))
-  ) {
-    performDH = true;
-    console.log(
-      `Detected need for DH ratchet step. Current theirRatchetKey: ${
-        nextState.theirRatchetKey
-          ? bytesToHex(nextState.theirRatchetKey)
-          : "null"
-      }, Message PubKey: ${bytesToHex(header.publicKey)}`
-    );
-  }
-
-  if (performDH) {
-    // --- Store Skipped Message Keys from Old Chain ---
+  if (message.type === MessageType.PRE_KEY) {
+    // Store any skipped keys from the old chain first
     if (receivingChain && nextState.theirRatchetKey) {
-      console.log(
-        `Storing skipped message keys from old receiving chain (associated with PubKey: ${bytesToHex(
-          nextState.theirRatchetKey
-        )}) up to index ${header.previousCounter}.`
-      );
-      const oldSkipped = new Map(nextState.skippedRatchetKeys); // Start with existing globally skipped keys
-      const oldRemotePubKey = nextState.theirRatchetKey; // The key associated with the old chain
+      const oldSkipped = new Map(nextState.skippedRatchetKeys);
+      const remoteKey = nextState.theirRatchetKey;
 
-      // Add keys already skipped within the old chain state itself
-      for (const [idx, keys] of receivingChain.skippedMessageKeys.entries()) {
-        const keyLookup = getSkippedKeyLookupKey({
-          publicKey: oldRemotePubKey,
-          previousCounter: 0, // PN is not relevant for identifying the key itself
-          messageCounter: idx,
-        });
-        if (!oldSkipped.has(keyLookup)) {
-          oldSkipped.set(keyLookup, keys);
-          console.log(` -> Stored internally skipped key for index ${idx}`);
-        }
+      // internal skipped
+      for (let [idx, keys] of receivingChain.skippedMessageKeys) {
+        const keyLookup = `${idx}:${bytesToHex(remoteKey)}`;
+        if (!oldSkipped.has(keyLookup)) oldSkipped.set(keyLookup, keys);
       }
-
-      // Advance the old chain up to PN (previousCounter) and store those keys too
-      let tempChainKey = receivingChain.chainKey;
-      const startIndex = receivingChain.chainIndex;
-      const endIndex = header.previousCounter; // PN from the message header
-      if (endIndex < startIndex) {
-        console.warn(
-          `Message PN (${endIndex}) is less than current chain index (${startIndex}). Cannot skip future keys.`
-        );
-      } else {
-        const numToSkip = Math.min(endIndex - startIndex, MAX_SKIP); // Limit skipping
-        console.log(
-          `Advancing old chain from ${startIndex} up to ${
-            startIndex + numToSkip
-          } (max ${endIndex}) to store skipped keys.`
-        );
-        for (let i = 0; i < numToSkip; i++) {
-          const currentIdx = startIndex + i;
-          const keys = await deriveMessageKeysFromChainKey(tempChainKey);
-          const keyLookup = getSkippedKeyLookupKey({
-            publicKey: oldRemotePubKey,
-            previousCounter: 0,
-            messageCounter: currentIdx,
-          });
-          if (!oldSkipped.has(keyLookup)) {
-            oldSkipped.set(keyLookup, keys);
-            console.log(` -> Stored newly skipped key for index ${currentIdx}`);
-          }
-          tempChainKey = await advanceChainKey(tempChainKey);
-        }
+      // skip up to PN
+      let tempKey = receivingChain.chainKey;
+      for (let i = receivingChain.chainIndex; i < header.previousCounter; i++) {
+        const k = await deriveMessageKeysFromChainKey(tempKey);
+        oldSkipped.set(`${i}:${bytesToHex(remoteKey)}`, k);
+        tempKey = await advanceChainKey(tempKey);
       }
-      nextState.skippedRatchetKeys = oldSkipped; // Update the global skipped keys map
-      console.log(
-        `Finished storing skipped keys. Total skipped: ${nextState.skippedRatchetKeys.size}`
-      );
-    } // End storing skipped keys
+      nextState.skippedRatchetKeys = oldSkipped;
+      console.log("Stored skipped keys from old chain");
+    }
 
-    // --- Perform DH Ratchet Calculation ---
-    console.log("Performing DH calculation for new receiving chain.");
-    // Use our *current* enhanced private key (y'_t) and the *sender's* public key from the header (RK_sender, t pub)
-    const dhOutput = computeDH(
-      nextState.ourEnhancedPrivateKey, // y'_t
-      header.publicKey // RK_sender, t pub
-    );
+    // Now do the DH‐ratchet step
+    console.log("🔄 Performing DH ratchet (PRE_KEY)");
+    const dh = computeDH(nextState.ourEnhancedPrivateKey, header.publicKey);
     const { newRootKey, newChainKey } = await performDHRatchetStep(
       nextState.rootKey,
-      dhOutput
+      dh
     );
-    console.log("Derived new root key and receiving chain key.");
-
-    // Initialize the new receiving chain
     receivingChain = {
       chainKey: newChainKey,
       chainIndex: 0,
@@ -839,80 +764,47 @@ export async function ratchetDecrypt(
     };
     nextState.rootKey = newRootKey;
     nextState.receivingChain = receivingChain;
-    nextState.theirRatchetKey = header.publicKey; // Update expected sender key
-    nextState.recvMsgCounter = 0; // Reset counter for the new chain
+    nextState.theirRatchetKey = header.publicKey;
 
-    // --- Update Our Ratchet Key Pair (for next send) ---
-    // This DH step also triggers an update on our *sending* side
-    nextState.prevSendMsgCounter = nextState.sendMsgCounter; // Store count of messages sent in the chain we just finished
-    nextState.sendMsgCounter = 0; // Reset send counter
-    nextState.sendingChain = null; // Discard old sending chain (will be recreated on next send)
+    // reset send counters
+    nextState.prevSendMsgCounter = nextState.sendMsgCounter;
+    nextState.sendMsgCounter = 0;
+    nextState.sendingChain = null;
 
-    // Generate the *next* ratchet key pair (RK_our, t+1)
-    const nextRatchetKeyPair = generateECDHKeyPair();
-    console.log("Generated next ratchet key pair (for sending).");
-
-    // --- Triple Ratchet Enhancement (Receiver Side) ---
-    // Calculate the *next* enhanced private key (y'_{t+1})
-    // Uses the *newly generated* private key (y_{t+1}) and the *just calculated* DH output (I_t)
-    const nextEnhancedPrivateKey = calculateEnhancedPrivateKey(
-      nextRatchetKeyPair.privateKey, // y_{t+1}
-      dhOutput // I_t
-    );
-    console.log("Calculated next enhanced private key (for sending).");
-
-    // Update state with the new key pair and enhanced key for the *next* DH step initiated by us
-    nextState.ourRatchetKeyPair = nextRatchetKeyPair; // Store RK_our, t+1
-    nextState.ourEnhancedPrivateKey = nextEnhancedPrivateKey; // Store y'_{t+1}
-    console.log("DH ratchet step completed.");
-  } // End DH Ratchet Step
-
-  // --- Symmetric Ratchet Decryption ---
-  if (!receivingChain) {
-    // Should be impossible if DH step logic is correct
-    throw new Error(
-      "Internal error: Receiving chain not available for decryption after DH check."
-    );
+    // generate *next* ratchet key for *our* next send
+    const nextRK = generateECDHKeyPair();
+    const nextX = calculateEnhancedPrivateKey(nextRK.privateKey, dh);
+    nextState.ourRatchetKeyPair = nextRK;
+    nextState.ourEnhancedPrivateKey = nextX;
+    console.log("DH ratchet completed");
   }
 
-  console.log(
-    `Attempting symmetric decryption for message N=${header.messageCounter} using current receiving chain.`
+  // 3) Symmetric‐ratchet decryption
+  if (!nextState.receivingChain) {
+    throw new Error("No receiving chain!");
+  }
+  console.log(`🔑 Symmetric ratchet decrypt, N=${header.messageCounter}`);
+  const { messageKeys, nextChainState } = await getSymRatchetMessageKey(
+    nextState.receivingChain,
+    header.messageCounter
   );
-  try {
-    // Get the message keys for the counter N from the current receiving chain
-    // This will advance the chain state, storing skipped keys if N > current index
-    const { messageKeys, nextChainState: updatedReceivingChain } =
-      await getSymRatchetMessageKey(receivingChain, header.messageCounter);
-    nextState.receivingChain = updatedReceivingChain; // Update receiving chain state
+  nextState.receivingChain = nextChainState;
 
-    // --- AES Decryption ---
-    const adObject = {
+  const aad = stringToBytes(
+    JSON.stringify({
       pk: bytesToHex(header.publicKey),
       pn: header.previousCounter,
       n: header.messageCounter,
-    };
-    const aadBuffer = stringToBytes(JSON.stringify(adObject)); // Reconstruct AD
-
-    console.log("Decrypting ciphertext with AES-GCM.");
-    plaintext = await decryptAES(
-      messageKeys.encKey,
-      message.ciphertext,
-      messageKeys.iv,
-      aadBuffer
-    );
-    console.log("Symmetric decryption successful.");
-  } catch (error) {
-    console.error("Symmetric decryption failed:", error);
-    // If getSymRatchetMessageKey failed (e.g., counter too old, too far ahead) or AES decrypt failed
-    throw new Error(
-      `Failed to decrypt message N=${header.messageCounter}: ${error}`
-    );
-  }
-
-  if (plaintext === null) {
-    // Should not happen if decryptAES resolves successfully
-    throw new Error("Decryption succeeded but plaintext is null.");
-  }
+    })
+  );
+  console.log("Decrypting with AES-GCM");
+  plaintext = await decryptAES(
+    messageKeys.encKey,
+    message.ciphertext,
+    messageKeys.iv,
+    aad
+  );
+  console.log("✔️ Symmetric decryption successful");
 
   return { plaintext, nextState };
 }

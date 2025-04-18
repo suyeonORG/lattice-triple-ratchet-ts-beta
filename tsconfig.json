@@ -1,28 +1,39 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
+    /* Base Options: */
+    "target": "ES2020", // Target modern JavaScript features supported by recent browsers
+    "module": "ES2020", // Output standard ES modules for <script type="module">
     "lib": [
-      "ES2020",
-      "DOM"
+      "ES2020", // Include ES2020 library typings
+      "DOM" // Include DOM typings (for window, document, localStorage, etc.)
     ],
-    "declaration": true,
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "noImplicitAny": true,
-    "noUnusedLocals": false,
-    "noUnusedParameters": false
+    "outDir": "./dist", // Output compiled JS to the 'dist' folder
+    "rootDir": "./src", // Specify the root directory of source files
+    /* Module Resolution Options: */
+    "moduleResolution": "Bundler", // Recommended modern resolution strategy for ES modules and Node-style imports
+    "esModuleInterop": true, // Allows default imports from commonjs modules (good practice)
+    // "resolveJsonModule": true, // Uncomment if you need to import JSON files directly
+    /* Emit Options: */
+    "declaration": true, // Generate corresponding '.d.ts' files for library usage
+    "sourceMap": true, // Generate '.js.map' files for easier debugging in browser dev tools
+    /* Strict Type-Checking Options: */
+    "strict": true, // Enable all strict type-checking options
+    "noImplicitAny": true, // Raise error on expressions and declarations with an implied 'any' type.
+    /* Additional Checks: */
+    "noUnusedLocals": false, // Set to true for stricter checks if desired (original was false)
+    "noUnusedParameters": false, // Set to true for stricter checks if desired (original was false)
+    // "noImplicitReturns": true, // Report error when not all code paths in function return a value.
+    // "noFallthroughCasesInSwitch": true, // Report errors for fallthrough cases in switch statement.
+    /* Completeness */
+    "skipLibCheck": true, // Skip type checking of declaration files (speeds up compilation)
+    "forceConsistentCasingInFileNames": true // Disallow inconsistently-cased references to the same file.
   },
   "include": [
-    "src/**/*"
+    "src/**/*" // Include all files within the src directory
   ],
   "exclude": [
-    "node_modules",
-    "**/*.test.ts",
-    "dist"
+    "node_modules", // Exclude the node_modules directory
+    // "**/*.test.ts", // Ensure this is commented out or removed to compile tests
+    "dist" // Exclude the output directory
   ]
 }

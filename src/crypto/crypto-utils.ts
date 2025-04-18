@@ -61,11 +61,18 @@ export function computeDH(
   privateKey: ECDHPrivateKey,
   publicKey: ECDHPublicKey
 ): Uint8Array {
-  // noble automatically handles compressed/uncompressed public keys
-  const sharedPoint = p256.getSharedSecret(privateKey, publicKey);
-  // The shared secret is the x-coordinate of the shared point.
-  // Noble's getSharedSecret returns the 32-byte x-coordinate directly.
-  return sharedPoint;
+  try {
+    // Noble's getSharedSecret() returns a 65-byte array: [0x04, X (32 bytes), Y (32 bytes)].
+    // We only need the 32-byte X-coordinate as the shared secret.
+    const sharedPoint65 = p256.getSharedSecret(privateKey, publicKey);
+    return sharedPoint65.subarray(1, 33);
+  } catch (error) {
+    console.error("DH computation failed:", error);
+    console.error("Private key length:", privateKey.length);
+    console.error("Public key length:", publicKey.length);
+    console.error("Public key prefix:", publicKey[0].toString(16));
+    throw new Error(`Failed to compute DH: ${error}`);
+  }
 }
 
 /**
@@ -89,46 +96,64 @@ export async function hkdfDerive(
   const infoBytes = info ? new Uint8Array(info) : new Uint8Array(0); // Default info: empty
   const inputBytes = new Uint8Array(input);
 
-  // 1. Import IKM as a temporary key for HKDF
-  const ikmKey = await crypto.subtle.importKey(
-    "raw",
-    inputBytes,
-    { name: "HKDF" },
-    false,
-    ["deriveKey"]
-  );
+  // Debug info
+  console.log("HKDF Input:", bytesToHex(inputBytes).slice(0, 16) + "...");
+  console.log("HKDF Salt:", bytesToHex(saltBytes).slice(0, 16) + "...");
+  console.log("HKDF Info:", bytesToHex(infoBytes).slice(0, 16) + "...");
 
-  // 2. Derive the keys
-  const derivedKeyPromises = [];
-  for (let i = 0; i < keyCount; i++) {
-    // Append counter to info for unique keys per derivation
-    const currentInfo = concatBuffers(infoBytes, new Uint8Array([i]));
-    derivedKeyPromises.push(
-      crypto.subtle
-        .deriveKey(
-          {
-            name: "HKDF",
-            salt: saltBytes,
-            info: currentInfo, // Use unique info for each key
-            hash: HASH_ALGORITHM_NAME,
-          },
-          ikmKey,
-          // Specify the algorithm for the *derived* key (HMAC in this case, but could be AES)
-          // For raw bytes export, using HMAC or AES key type here doesn't strictly matter
-          // as long as the length is correct and we export it raw.
-          // Using HMAC as a common case for derived symmetric keys.
-          {
-            name: "HMAC",
-            hash: HASH_ALGORITHM_NAME,
-            length: keyLengthBytes * 8,
-          },
-          true, // Allow export
-          ["sign", "verify"] // Permissions for the derived key (if kept as CryptoKey)
-        )
-        .then((key) => crypto.subtle.exportKey("raw", key)) // Export as raw bytes
+  try {
+    // 1. Import IKM as a temporary key for HKDF
+    const ikmKey = await crypto.subtle.importKey(
+      "raw",
+      inputBytes,
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
     );
+
+    // 2. Derive the keys
+    const derivedKeyPromises = [];
+    for (let i = 0; i < keyCount; i++) {
+      // Append counter to info for unique keys per derivation
+      const currentInfo = concatBuffers(infoBytes, new Uint8Array([i]));
+      derivedKeyPromises.push(
+        crypto.subtle
+          .deriveKey(
+            {
+              name: "HKDF",
+              salt: saltBytes,
+              info: currentInfo, // Use unique info for each key
+              hash: HASH_ALGORITHM_NAME,
+            },
+            ikmKey,
+            // Specify the algorithm for the *derived* key (HMAC in this case, but could be AES)
+            // For raw bytes export, using HMAC or AES key type here doesn't strictly matter
+            // as long as the length is correct and we export it raw.
+            // Using HMAC as a common case for derived symmetric keys.
+            {
+              name: "HMAC",
+              hash: HASH_ALGORITHM_NAME,
+              length: keyLengthBytes * 8,
+            },
+            true, // Allow export
+            ["sign", "verify"] // Permissions for the derived key (if kept as CryptoKey)
+          )
+          .then((key) => crypto.subtle.exportKey("raw", key)) // Export as raw bytes
+      );
+    }
+    const derivedKeys = await Promise.all(derivedKeyPromises);
+    // Debug first derived key
+    if (derivedKeys.length > 0) {
+      console.log(
+        "HKDF First derived key:",
+        bytesToHex(new Uint8Array(derivedKeys[0])).slice(0, 16) + "..."
+      );
+    }
+    return derivedKeys;
+  } catch (error) {
+    console.error("HKDF derivation failed:", error);
+    throw error;
   }
-  return Promise.all(derivedKeyPromises);
 }
 
 /**
@@ -140,10 +165,24 @@ export async function importHmacKey(
   keyData: ArrayBuffer | Uint8Array
 ): Promise<HMACKey> {
   const crypto = getCrypto();
-  return crypto.subtle.importKey("raw", keyData, HMAC_ALGORITHM, false, [
-    "sign",
-    "verify",
-  ]);
+  // make the HMAC key extractable so we can export it when doing the DH‑ratchet
+  try {
+    return crypto.subtle.importKey(
+      "raw",
+      keyData,
+      HMAC_ALGORITHM,
+      /* extractable: */ true,
+      ["sign", "verify"]
+    );
+  } catch (error) {
+    console.error("HMAC key import failed:", error);
+    console.error("Key data length:", new Uint8Array(keyData).length);
+    console.error(
+      "Key data (hex):",
+      bytesToHex(new Uint8Array(keyData)).slice(0, 32) + "..."
+    );
+    throw error;
+  }
 }
 
 /**
@@ -161,10 +200,16 @@ export async function importAesKey(
     );
   }
   const crypto = getCrypto();
-  return crypto.subtle.importKey("raw", keyBytes, AES_ALGORITHM, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+  try {
+    return crypto.subtle.importKey("raw", keyBytes, AES_ALGORITHM, true, [
+      "encrypt",
+      "decrypt",
+    ]);
+  } catch (error) {
+    console.error("AES key import failed:", error);
+    console.error("Key data (hex):", bytesToHex(keyBytes).slice(0, 32) + "...");
+    throw error;
+  }
 }
 
 /**
@@ -261,7 +306,30 @@ export async function encryptAES(
   if (additionalData) {
     params.additionalData = additionalData;
   }
-  return crypto.subtle.encrypt(params, key, plaintext);
+
+  // Debug encryption parameters
+  try {
+    const rawKey = await exportRawKey(key);
+    console.log(
+      "🔒 [Encrypt] encKey:",
+      bytesToHex(new Uint8Array(rawKey)).slice(0, 16) + "..."
+    );
+    console.log(
+      "🔒 [Encrypt] iv:",
+      bytesToHex(new Uint8Array(iv)).slice(0, 16) + "..."
+    );
+    if (additionalData) {
+      console.log(
+        "🔒 [Encrypt] aad:",
+        bytesToHex(new Uint8Array(additionalData)).slice(0, 16) + "..."
+      );
+    }
+
+    return crypto.subtle.encrypt(params, key, plaintext);
+  } catch (error) {
+    console.error("AES encryption failed:", error);
+    throw new Error(`Encryption failed: ${error}`);
+  }
 }
 
 /**
@@ -283,7 +351,26 @@ export async function decryptAES(
   if (additionalData) {
     params.additionalData = additionalData;
   }
+
+  // Debug decryption parameters
   try {
+    const rawKey = await exportRawKey(key);
+    console.log(
+      "🔓 [Decrypt] encKey:",
+      bytesToHex(new Uint8Array(rawKey)).slice(0, 16) + "..."
+    );
+    console.log(
+      "🔓 [Decrypt] iv:",
+      bytesToHex(new Uint8Array(iv)).slice(0, 16) + "..."
+    );
+    if (additionalData) {
+      console.log(
+        "🔓 [Decrypt] aad:",
+        bytesToHex(new Uint8Array(additionalData)).slice(0, 16) + "..."
+      );
+    }
+    console.log("🔓 [Decrypt] ciphertext length:", ciphertext.byteLength);
+
     return await crypto.subtle.decrypt(params, key, ciphertext);
   } catch (e) {
     console.error("AES decryption failed:", e);
